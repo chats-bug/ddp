@@ -11,11 +11,12 @@ console = Console()
 SEQ_LEN = 512
 BATCH_SIZE = 8
 LR = 3e-4
+DATASET_NAME = "togethercomputer/RedPajama-Data-1T-Sample"
 
 
 def load_train_objs():
     console.log("Loading dataset...")
-    hf_dataset = get_dataset("togethercomputer/RedPajama-Data-1T-Sample", split="train")
+    hf_dataset = get_dataset(DATASET_NAME, split="train")
     console.log("Splitting dataset...")
     hf_dataset = hf_dataset.train_test_split(test_size=0.001)
     train_dataset = hf_dataset["train"]
