@@ -1,0 +1,7 @@
+torch==2.2.0.dev20231105
+transformers==4.34.1
+trl==0.7.2
+rich==13.6.0
+datasets==2.14.6
+huggingface==0.0.1
+tqdm==4.66.1
