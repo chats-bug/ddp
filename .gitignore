@@ -28,3 +28,6 @@ test.ipynb
 
 # Macos files
 .DS_Store
+
+# Output dir with checkpoints
+output/
