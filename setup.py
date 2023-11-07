@@ -12,19 +12,27 @@ from single_gpu import Trainer
 console = Console()
 
 DATASET_NAME = "togethercomputer/RedPajama-Data-1T-Sample"
+VAL_SIZE = 0.001
 SEQ_LEN = 512
 BATCH_SIZE = 8
 LR = 3e-4
 WEIGHT_DECAY = 0.1
 NUM_EPOCHS = 1
-EVAL_EVERY = 25
-SAVE_EVERY = 25
+EVAL_EVERY = 500
+SAVE_EVERY = 500
+MAX_CHECKPOINT_LIMIT = 5
 LOG_EVERY = 1
 GRAD_ACCUMULATION_STEPS = 4
 TORCH_DTYPE = "fp16"
 GPU_ID = 0
 SMALLER = False
 MAX_GRAD_NORM = None
+REPORT_TO = None
+WANDB_PROJECT = "pytorch-training"
+WANDB_RUN = None
+ANNEAL_STRATEGY = "cos"
+WARMUP_STEPS = 0.1
+MIN_LR_FACTOR = 10
 
 
 def parse_args():
@@ -42,6 +50,9 @@ def parse_args():
     parser.add_argument("--eval_every", type=int, default=EVAL_EVERY)
     parser.add_argument("--save_every", type=int, default=SAVE_EVERY)
     parser.add_argument("--log_every", type=int, default=LOG_EVERY)
+    parser.add_argument("--report_to", type=str, default=REPORT_TO)
+    parser.add_argument("--wandb_project", type=str, default=WANDB_PROJECT)
+    parser.add_argument("--wandb_run", type=str, default=WANDB_RUN)
     parser.add_argument(
         "--grad_accumulation_steps", type=int, default=GRAD_ACCUMULATION_STEPS
     )
@@ -63,7 +74,7 @@ def load_train_objs(
     console.log("Loading dataset...")
     hf_dataset = get_dataset(dataset, split="train")
     console.log("Splitting dataset...")
-    hf_dataset = hf_dataset.train_test_split(test_size=0.0001)
+    hf_dataset = hf_dataset.train_test_split(test_size=VAL_SIZE)
     train_dataset = hf_dataset["train"]
     val_dataset = hf_dataset["test"]
 
@@ -146,12 +157,17 @@ if __name__ == "__main__":
 
     # Number of steps is used for the learning rate scheduler
     num_steps = len(train_dataloader) * args.num_epochs // args.grad_accumulation_steps
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_mult=2, T_0=num_steps // 50, eta_min=0.1 * args.lr, last_epoch=-1
-    )
-    # lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(
-    # 	optimizer, gamma=0.95, last_epoch=-1
+    # lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    #     optimizer, T_mult=2, T_0=num_steps // 50, eta_min=0.1 * args.lr, last_epoch=-1
     # )
+    lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=args.lr,
+        total_steps=num_steps,
+        anneal_strategy=ANNEAL_STRATEGY,
+        pct_start=WARMUP_STEPS,
+        final_div_factor=MIN_LR_FACTOR,
+    )
 
     trainer = Trainer(
         model=model,
@@ -164,9 +180,11 @@ if __name__ == "__main__":
         eval_every=args.eval_every,
         save_every=args.save_every,
         log_every=args.log_every,
+        max_checkpoint_limit=MAX_CHECKPOINT_LIMIT,
         grad_accumulation_steps=args.grad_accumulation_steps,
         torch_dtype=torch_dtype,
         max_grad_norm=args.max_grad_norm,
+        report_to=args.report_to,
     )
 
     # Print all the important model, data and training parameters
@@ -198,10 +216,12 @@ if __name__ == "__main__":
         table.add_row("T Mult", str(lr_scheduler.T_mult))
         table.add_row("T 0", str(lr_scheduler.T_0))
         table.add_row("Eta Min", str(lr_scheduler.eta_min))
-    elif isinstance(lr_scheduler, torch.optim.lr_scheduler.ExponentialLR):
-        table.add_row("LR Scheduler", "ExponentialLR")
+    elif isinstance(lr_scheduler, torch.optim.lr_scheduler.OneCycleLR):
+        table.add_row("LR Scheduler", "OneCycleLR")
         table.add_row("Learning Rate", str(args.lr))
-        table.add_row("Gamma", str(lr_scheduler.gamma))
+        table.add_row("Anneal Strategy", ANNEAL_STRATEGY)
+        table.add_row("Warmup Steps", f"{WARMUP_STEPS*100}%")
+        table.add_row("Min Learning Rate", str(args.lr / MIN_LR_FACTOR))
 
     table.add_row("", "")
     table.add_row("-------------------", "-------------------")
@@ -229,4 +249,8 @@ if __name__ == "__main__":
     console.print(table)
 
     console.log(f"Starting training with {device} using {torch_dtype}...")
-    trainer.train(max_epochs=args.num_epochs)
+    trainer.train(
+        max_epochs=args.num_epochs,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run,
+    )
