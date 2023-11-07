@@ -287,11 +287,11 @@ class Trainer:
 			}
 			if wandb_project:
 				if wandb_run_name:
-					wandb.init(project=wandb_project, name=wandb_run_name)
+					wandb.init(project=wandb_project, name=wandb_run_name, config=wandb_config)
 				else:
-					wandb.init(project=wandb_project)
+					wandb.init(project=wandb_project, config=wandb_config)
 			else:
-				wandb.init()
+				wandb.init(config=wandb_config)
 
 		print(f"Transferring model to {self.gpu_id}...")
 		self.model.to(self.gpu_id)
