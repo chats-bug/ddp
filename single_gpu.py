@@ -1,7 +1,7 @@
+from typing import Union, Optional
+
 import torch
 from rich.console import Console
-from tqdm import tqdm
-from typing import Union, Optional
 from rich.progress import Progress
 
 from datautils import PoorMansDataLoader
@@ -44,7 +44,7 @@ class Trainer:
             self.gpu_id = self.device
 
         self.scaler = None
-        if self.torch_dtype is not torch.float32:
+        if self.torch_dtype != torch.float32:
             # assert self.device in ["cpu", "cuda", torch.device("cpu"), torch.device("cuda")], \
             #     "Mixed precision training is only supported on CPU and CUDA devices"
             if self.device not in ["cpu", "cuda", torch.device("cpu"), torch.device("cuda")]:
@@ -52,11 +52,11 @@ class Trainer:
                 console.log(
                     "[bold red]Mixed precision training is only supported on CPU and CUDA devices[/bold red]"
                 )
-                console.log(f"Currently setting the default torch type to the {self.torch_dtype}", style="bold red")
+                console.log(f"Setting the default torch type to the {self.torch_dtype}", style="bold red")
                 # set the default torch type to the specified torch type
                 torch.set_default_dtype(self.torch_dtype)
             else:
-                self.scaler = torch.cuda.amp.GradScaler(enabled=False)
+                self.scaler = torch.cuda.amp.GradScaler(enabled=True)
 
     def _run_batch(self, source, target, step=1):
         self.optimizer.zero_grad()
