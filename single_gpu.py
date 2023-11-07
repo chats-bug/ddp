@@ -9,17 +9,6 @@ from datautils import PoorMansDataLoader
 console = Console()
 
 
-def convert_target_to_logits(vocab_size, target):
-    # target is a tensor of shape (seq_len,)
-    # convert it to a tensor of shape (seq_len, vocab_size)
-    # where each row is a one-hot vector
-    batch_size = target.size(0)
-    seq_len = target.size(1)
-    target = target.unsqueeze(-1)
-    one_hot = torch.zeros(batch_size, seq_len, vocab_size, device=target.device)
-    return one_hot.scatter_(2, target, 1)
-
-
 class Trainer:
     def __init__(
             self,
