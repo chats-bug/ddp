@@ -1,115 +1,152 @@
 import torch
 import torch.optim
-from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaConfig
 from rich.console import Console
 
 from datautils import get_dataset, CustomDataset, PoorMansDataLoader
+from model import llama_1_7_model, smaller_llama
+from modelutils import num_trainable_params
 from single_gpu import Trainer
 
 console = Console()
 
+DATASET_NAME = "togethercomputer/RedPajama-Data-1T-Sample"
 SEQ_LEN = 512
 BATCH_SIZE = 8
 LR = 3e-4
-DATASET_NAME = "togethercomputer/RedPajama-Data-1T-Sample"
+WEIGHT_DECAY = 0.1
+NUM_EPOCHS = 1
+EVAL_EVERY = 10000
+SAVE_EVERY = 10000
+LOG_EVERY = 1
+GRAD_ACCUMULATION_STEPS = 4
+TORCH_DTYPE = "fp16"
+GPU_ID = 0
+SMALLER = False
 
 
-def load_train_objs():
+def parse_args():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--small_model", type=bool, default=SMALLER)
+    parser.add_argument("--seq_len", type=int, default=SEQ_LEN)
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--lr", type=float, default=LR)
+    parser.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
+    parser.add_argument("--dataset_name", type=str, default=DATASET_NAME)
+    parser.add_argument("--num_epochs", type=int, default=NUM_EPOCHS)
+    parser.add_argument("--eval_every", type=int, default=EVAL_EVERY)
+    parser.add_argument("--save_every", type=int, default=SAVE_EVERY)
+    parser.add_argument("--log_every", type=int, default=LOG_EVERY)
+    parser.add_argument(
+        "--grad_accumulation_steps", type=int, default=GRAD_ACCUMULATION_STEPS
+    )
+    parser.add_argument("--torch_dtype", type=str, default=TORCH_DTYPE)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--gpu_id", type=int, default=GPU_ID)
+
+    args = parser.parse_args()
+    return args
+
+
+def load_train_objs(
+    dataset: str,
+    seq_len: int,
+    lr: float,
+    weight_decay: float,
+    smaller_model: bool = False,
+):
     console.log("Loading dataset...")
-    hf_dataset = get_dataset(DATASET_NAME, split="train")
+    hf_dataset = get_dataset(dataset, split="train")
     console.log("Splitting dataset...")
     hf_dataset = hf_dataset.train_test_split(test_size=0.001)
     train_dataset = hf_dataset["train"]
     val_dataset = hf_dataset["test"]
 
-    console.log("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+    console.log("Loading model and tokenizer...")
+    if smaller_model:
+        model, tokenizer = smaller_llama(seq_len)
+    else:
+        model, tokenizer = llama_1_7_model(seq_len)
+
     console.log("Making custom dataset...")
     train_dataset = CustomDataset(
-        train_dataset, tokenizer, seq_len=SEQ_LEN, dataset_text_field="text"
+        train_dataset, tokenizer, seq_len=seq_len, dataset_text_field="text"
     )
     val_dataset = CustomDataset(
-        val_dataset, tokenizer, seq_len=SEQ_LEN, dataset_text_field="text"
+        val_dataset, tokenizer, seq_len=seq_len, dataset_text_field="text"
     )
 
-    console.log("Loading model...")
-    larger_model = AutoModelForCausalLM.from_config(
-        LlamaConfig(
-            vocab_size=32000,
-            hidden_size=2048,
-            intermediate_size=8192,
-            num_hidden_layers=24,
-            num_attention_heads=32,
-            num_key_value_heads=32,
-            hidden_act="silu",
-            max_position_embeddings=SEQ_LEN,
-            initializer_range=0.02,
-            rms_norm_eps=1e-6,
-            use_cache=True,
-            pad_token_id=None,
-            bos_token_id=1,
-            eos_token_id=2,
-            pretraining_tp=1,
-            tie_word_embeddings=False,
-            rope_theta=10000.0,
-            rope_scaling=None,
-            attention_bias=False,
-        )
-    )
-    smaller_model = AutoModelForCausalLM.from_config(
-        LlamaConfig(
-            vocab_size=32000,
-            hidden_size=512,
-            intermediate_size=1024,
-            num_hidden_layers=8,
-            num_attention_heads=8,
-            num_key_value_heads=8,
-            hidden_act="silu",
-            max_position_embeddings=512,
-            initializer_range=0.02,
-            rms_norm_eps=1e-6,
-            use_cache=True,
-            pad_token_id=None,
-            bos_token_id=1,
-            eos_token_id=2,
-            pretraining_tp=1,
-            tie_word_embeddings=False,
-            rope_theta=10000.0,
-            rope_scaling=None,
-            attention_bias=False,
-        )
-    )
-    model = smaller_model
     console.log("Setting up optimizer...")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.1)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_mult=1, T_0=50, eta_min=0.1 * LR, last_epoch=-1
-    )
-
-    return train_dataset, val_dataset, model, optimizer, lr_scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    return train_dataset, val_dataset, model, tokenizer, optimizer
 
 
 def prepare_dataloader(dataset: CustomDataset, batch_size: int):
     return PoorMansDataLoader(dataset, batch_size=batch_size)
 
 
-def num_trainable_params(model: torch.nn.Module):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
 if __name__ == "__main__":
+    args = parse_args()
+
+    # Setting the device
+    # Using GPUs significantly speeds up the training process
+    # as well as inference
     device = torch.device("cpu")
     if torch.backends.mps.is_available():
         device = torch.device("mps")
     elif torch.cuda.is_available():
         device = torch.device("cuda")
+    device = args.device or device
 
-    train_dataset, val_dataset, model, optimizer, lr_scheduler = load_train_objs()
-    train_dataloader = prepare_dataloader(train_dataset, batch_size=BATCH_SIZE)
-    val_dataloader = prepare_dataloader(val_dataset, batch_size=BATCH_SIZE)
+    # Setting the torch dtype
+    # The default is 32-bit floating point
+    # Using mixed precision training can speed up the training process
+    # Mixed precision automatically casts the model weights to 16-bit floating point
+    # and rescales the gradients to 32-bit floating point
+    # NOTE:
+    # `mps` (Apple Silicon) currently doesn't support mixed precision training
+    if args.torch_dtype == "fp32":
+        torch_dtype = torch.float32
+    # Using fp16 reduces training time by a substantial margin
+    # All `cuda` GPUs support fp16
+    elif args.torch_dtype == "fp16":
+        torch_dtype = torch.float16
+    # bf16: Brain Floating Point
+    # Not supported by all GPUs
+    # Only Ampere GPUs support bf16, namely A100 and A6000
+    elif args.torch_dtype == "bf16":
+        torch_dtype = torch.bfloat16
+    else:
+        console.log(f"Invalid torch_dtype: {args.torch_dtype}")
+        console.log("Setting torch_dtype to fp16")
+        torch_dtype = torch.float16
 
-    console.log(f"Model Specs: {model.config}")
-    console.log(f"Trainable Parameters: {num_trainable_params(model):,}")
+    # Training Objects are loaded here
+    # Datasets(train and validation)
+    # model, tokenizer and optimizer
+    train_dataset, val_dataset, model, tokenizer, optimizer = load_train_objs(
+        dataset=args.dataset_name,
+        seq_len=args.seq_len,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        smaller_model=args.small_model,
+    )
+
+    # DataLoaders process the datasets
+    # and provide an iterator
+    train_dataloader = prepare_dataloader(train_dataset, batch_size=args.batch_size)
+    val_dataloader = prepare_dataloader(val_dataset, batch_size=args.batch_size)
+
+    # Number of steps is used for the learning rate scheduler
+    num_steps = len(train_dataloader) * args.num_epochs
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_mult=1, T_0=num_steps, eta_min=0.1 * args.lr, last_epoch=-1
+    )
+
+    console.print(f"Model Specs: {model.config}")
+    console.print(f"Trainable Parameters: {num_trainable_params(model):,}")
+    console.print(f"Number of Steps: {num_steps:,}")
 
     trainer = Trainer(
         model=model,
@@ -117,14 +154,14 @@ if __name__ == "__main__":
         val_dataloader=val_dataloader,
         optimizer=optimizer,
         lr_schedular=lr_scheduler,
-        gpu_id=0,
+        gpu_id=args.gpu_id,
         device=device,
-        eval_every=10000,
-        save_every=10000,
-        log_every=1,
-        grad_accumulation_steps=4,
-        torch_dtype=torch.float16,
+        eval_every=args.eval_every,
+        save_every=args.save_every,
+        log_every=args.log_every,
+        grad_accumulation_steps=args.grad_accumulation_steps,
+        torch_dtype=torch_dtype,
     )
 
-    console.log(f"Starting training with {device}...")
-    trainer.train(max_epochs=1)
+    console.log(f"Starting training with {device} using {torch_dtype}...")
+    trainer.train(max_epochs=args.num_epochs)
