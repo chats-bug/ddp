@@ -31,3 +31,6 @@ test.ipynb
 
 # Output dir with checkpoints
 output/
+
+# Wandb dir
+wandb/
