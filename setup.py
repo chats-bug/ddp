@@ -1,6 +1,8 @@
+from shtab import Optional
 import torch
 import torch.optim
 from rich.console import Console
+from rich.table import Table
 
 from datautils import get_dataset, CustomDataset, PoorMansDataLoader
 from model import llama_1_7_model, smaller_llama
@@ -15,24 +17,26 @@ BATCH_SIZE = 8
 LR = 3e-4
 WEIGHT_DECAY = 0.1
 NUM_EPOCHS = 1
-EVAL_EVERY = 10000
-SAVE_EVERY = 10000
+EVAL_EVERY = 25
+SAVE_EVERY = 25
 LOG_EVERY = 1
 GRAD_ACCUMULATION_STEPS = 4
 TORCH_DTYPE = "fp16"
 GPU_ID = 0
 SMALLER = False
+MAX_GRAD_NORM = None
 
 
 def parse_args():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--small_model", type=bool, default=SMALLER)
+    parser.add_argument("--small_model", action=argparse.BooleanOptionalAction)
     parser.add_argument("--seq_len", type=int, default=SEQ_LEN)
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
+    parser.add_argument("--max_grad_norm", type=float, default=MAX_GRAD_NORM)
     parser.add_argument("--dataset_name", type=str, default=DATASET_NAME)
     parser.add_argument("--num_epochs", type=int, default=NUM_EPOCHS)
     parser.add_argument("--eval_every", type=int, default=EVAL_EVERY)
@@ -59,15 +63,17 @@ def load_train_objs(
     console.log("Loading dataset...")
     hf_dataset = get_dataset(dataset, split="train")
     console.log("Splitting dataset...")
-    hf_dataset = hf_dataset.train_test_split(test_size=0.001)
+    hf_dataset = hf_dataset.train_test_split(test_size=0.0001)
     train_dataset = hf_dataset["train"]
     val_dataset = hf_dataset["test"]
 
     console.log("Loading model and tokenizer...")
     if smaller_model:
-        model, tokenizer = smaller_llama(seq_len)
+        packed_obj = smaller_llama(seq_len)
     else:
-        model, tokenizer = llama_1_7_model(seq_len)
+        packed_obj = llama_1_7_model(seq_len)
+    model = packed_obj["model"]
+    tokenizer = packed_obj["tokenizer"]
 
     console.log("Making custom dataset...")
     train_dataset = CustomDataset(
@@ -92,11 +98,11 @@ if __name__ == "__main__":
     # Setting the device
     # Using GPUs significantly speeds up the training process
     # as well as inference
-    device = torch.device("cpu")
+    device = "cpu"
     if torch.backends.mps.is_available():
-        device = torch.device("mps")
+        device = "mps"
     elif torch.cuda.is_available():
-        device = torch.device("cuda")
+        device = "cuda"
     device = args.device or device
 
     # Setting the torch dtype
@@ -139,14 +145,13 @@ if __name__ == "__main__":
     val_dataloader = prepare_dataloader(val_dataset, batch_size=args.batch_size)
 
     # Number of steps is used for the learning rate scheduler
-    num_steps = len(train_dataloader) * args.num_epochs
+    num_steps = len(train_dataloader) * args.num_epochs // args.grad_accumulation_steps
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_mult=1, T_0=num_steps, eta_min=0.1 * args.lr, last_epoch=-1
+        optimizer, T_mult=2, T_0=num_steps // 50, eta_min=0.1 * args.lr, last_epoch=-1
     )
-
-    console.print(f"Model Specs: {model.config}")
-    console.print(f"Trainable Parameters: {num_trainable_params(model):,}")
-    console.print(f"Number of Steps: {num_steps:,}")
+    # lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+    # 	optimizer, gamma=0.95, last_epoch=-1
+    # )
 
     trainer = Trainer(
         model=model,
@@ -161,7 +166,67 @@ if __name__ == "__main__":
         log_every=args.log_every,
         grad_accumulation_steps=args.grad_accumulation_steps,
         torch_dtype=torch_dtype,
+        max_grad_norm=args.max_grad_norm,
     )
+
+    # Print all the important model, data and training parameters
+    table = Table(title="Training Parameters")
+    table.add_column("Parameter")
+    table.add_column("Value")
+
+    # Model parameters
+    table.add_row("Model Type", str(model.config.model_type))
+    table.add_row("Model Size", f"{(num_trainable_params(model) / 1e9):.2f}B")
+    table.add_row("Dataset", str(args.dataset_name))
+    table.add_row("Sequence Length", str(args.seq_len))
+
+    table.add_row("", "")
+    table.add_row("-------------------", "-------------------")
+    # Optimizer parameters
+    table.add_row("Optim", "AdamW")
+    table.add_row("Beta 1", str(optimizer.defaults["betas"][0]))
+    table.add_row("Beta 2", str(optimizer.defaults["betas"][1]))
+    table.add_row("Epsilon", str(optimizer.defaults["eps"]))
+    table.add_row("Weight Decay", str(optimizer.defaults["weight_decay"]))
+
+    table.add_row("", "")
+    table.add_row("-------------------", "-------------------")
+    # Learning rate scheduler parameters
+    if isinstance(lr_scheduler, torch.optim.lr_scheduler.CosineAnnealingWarmRestarts):
+        table.add_row("LR Scheduler", "CosineAnnealingWarmRestarts")
+        table.add_row("Learning Rate", str(args.lr))
+        table.add_row("T Mult", str(lr_scheduler.T_mult))
+        table.add_row("T 0", str(lr_scheduler.T_0))
+        table.add_row("Eta Min", str(lr_scheduler.eta_min))
+    elif isinstance(lr_scheduler, torch.optim.lr_scheduler.ExponentialLR):
+        table.add_row("LR Scheduler", "ExponentialLR")
+        table.add_row("Learning Rate", str(args.lr))
+        table.add_row("Gamma", str(lr_scheduler.gamma))
+
+    table.add_row("", "")
+    table.add_row("-------------------", "-------------------")
+    # Training parameters
+    table.add_row("Batch Size", str(args.batch_size))
+    table.add_row("Max Grad Norm", str(args.max_grad_norm))
+    table.add_row("Grad Accumulation Steps", str(args.grad_accumulation_steps))
+    table.add_row("Number of Steps", f"{num_steps:,}")
+    table.add_row("Number of Epochs", str(args.num_epochs))
+
+    table.add_row("", "")
+    table.add_row("-------------------", "-------------------")
+    # Logging and saving parameters
+    table.add_row("Eval Every", str(args.eval_every))
+    table.add_row("Save Every", str(args.save_every))
+    table.add_row("Log Every", str(args.log_every))
+
+    table.add_row("", "")
+    # Device and torch dtype
+    table.add_row("Torch Dtype", str(args.torch_dtype))
+    table.add_row("Device", str(device))
+    table.add_row("GPU ID", str(args.gpu_id))
+
+    console.print("Training info:")
+    console.print(table)
 
     console.log(f"Starting training with {device} using {torch_dtype}...")
     trainer.train(max_epochs=args.num_epochs)
