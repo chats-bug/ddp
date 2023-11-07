@@ -6,10 +6,10 @@ import torch
 
 
 def get_dataset(
-        dataset_name: str,
-        subset: Optional[str] = None,
-        split: Optional[str] = None,
-        **kwargs,
+    dataset_name: str,
+    subset: Optional[str] = None,
+    split: Optional[str] = None,
+    **kwargs,
 ) -> HFDataset:
     data_path = dataset_name
     if subset:
@@ -19,7 +19,7 @@ def get_dataset(
 
 class CustomDataset(Dataset):
     def __init__(
-            self, hf_dataset: HFDataset, tokenizer, seq_len: int = 1024, **kwargs
+        self, hf_dataset: HFDataset, tokenizer, seq_len: int = 1024, **kwargs
     ) -> None:
         self.hf_dataset = hf_dataset
         self.dataset = ConstantLengthDataset(
@@ -48,6 +48,9 @@ class PoorMansDataLoader:
 
     def __len__(self) -> int:
         return len(self.dataset) // self.batch_size
+
+    def get_batch_size(self) -> int:
+        return self.batch_size
 
     def __iter__(self):
         counter = 1
