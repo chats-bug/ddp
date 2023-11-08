@@ -34,3 +34,6 @@ output/
 
 # Wandb dir
 wandb/
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints
