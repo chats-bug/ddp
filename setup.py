@@ -1,4 +1,4 @@
-from shtab import Optional
+from typing import Optional
 import torch
 import torch.optim
 from rich.console import Console
@@ -8,6 +8,7 @@ from datautils import get_dataset, CustomDataset, PoorMansDataLoader
 from model import llama_1_7_model, smaller_llama
 from modelutils import num_trainable_params
 from single_gpu import Trainer
+from optimutils import WarmupCosineWithDecay
 
 console = Console()
 
@@ -43,6 +44,9 @@ def parse_args():
     parser.add_argument("--seq_len", type=int, default=SEQ_LEN)
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     parser.add_argument("--lr", type=float, default=LR)
+    parser.add_argument("--warmup", type=float, default=WARMUP_STEPS)
+    parser.add_argument("--min_lr_factor", type=float, default=MIN_LR_FACTOR)
+    parser.add_argument("--anneal", type=str, default=ANNEAL_STRATEGY)
     parser.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
     parser.add_argument("--max_grad_norm", type=float, default=MAX_GRAD_NORM)
     parser.add_argument("--dataset_name", type=str, default=DATASET_NAME)
@@ -73,6 +77,8 @@ def load_train_objs(
 ):
     console.log("Loading dataset...")
     hf_dataset = get_dataset(dataset, split="train")
+    # Shuffle the dataset
+    hf_dataset = hf_dataset.shuffle()
     console.log("Splitting dataset...")
     hf_dataset = hf_dataset.train_test_split(test_size=VAL_SIZE)
     train_dataset = hf_dataset["train"]
@@ -157,17 +163,19 @@ if __name__ == "__main__":
 
     # Number of steps is used for the learning rate scheduler
     num_steps = len(train_dataloader) * args.num_epochs // args.grad_accumulation_steps
-    # lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-    #     optimizer, T_mult=2, T_0=num_steps // 50, eta_min=0.1 * args.lr, last_epoch=-1
-    # )
-    lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.lr,
-        total_steps=num_steps,
-        anneal_strategy=ANNEAL_STRATEGY,
-        pct_start=WARMUP_STEPS,
-        final_div_factor=MIN_LR_FACTOR,
-    )
+    if args.anneal == "cos":
+        lr_scheduler = WarmupCosineWithDecay(
+            optimizer,
+            warmup_steps=int(args.warmup * num_steps // args.num_epochs),
+            t_total=num_steps,
+            steps_per_epoch=len(train_dataloader),
+            eta_max=args.lr,
+            eta_min=args.lr / args.min_lr_factor,
+        )
+    else:
+        console.log(f"Invalid anneal strategy: {args.anneal}", style="bold red")
+        console.log("Not using a learning rate scheduler")
+        lr_scheduler = None
 
     trainer = Trainer(
         model=model,
@@ -210,18 +218,11 @@ if __name__ == "__main__":
     table.add_row("", "")
     table.add_row("-------------------", "-------------------")
     # Learning rate scheduler parameters
-    if isinstance(lr_scheduler, torch.optim.lr_scheduler.CosineAnnealingWarmRestarts):
-        table.add_row("LR Scheduler", "CosineAnnealingWarmRestarts")
-        table.add_row("Learning Rate", str(args.lr))
-        table.add_row("T Mult", str(lr_scheduler.T_mult))
-        table.add_row("T 0", str(lr_scheduler.T_0))
+    if isinstance(lr_scheduler, WarmupCosineWithDecay):
+        table.add_row("Anneal Strategy", "Cosine")
+        table.add_row("Warmup Steps", str(lr_scheduler.warmup_steps))
+        table.add_row("Eta Max", str(lr_scheduler.eta_max))
         table.add_row("Eta Min", str(lr_scheduler.eta_min))
-    elif isinstance(lr_scheduler, torch.optim.lr_scheduler.OneCycleLR):
-        table.add_row("LR Scheduler", "OneCycleLR")
-        table.add_row("Learning Rate", str(args.lr))
-        table.add_row("Anneal Strategy", ANNEAL_STRATEGY)
-        table.add_row("Warmup Steps", f"{WARMUP_STEPS*100}%")
-        table.add_row("Min Learning Rate", str(args.lr / MIN_LR_FACTOR))
 
     table.add_row("", "")
     table.add_row("-------------------", "-------------------")
