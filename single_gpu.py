@@ -102,6 +102,8 @@ class Trainer:
 			with torch.autocast(device_type=self.device, dtype=self.torch_dtype):
 				output = self.model(source, labels=target)
 				loss = output.loss
+				# Normalize the loss for the grad_accumulation_steps
+				loss = loss / self.grad_accumulation_steps
 			self.scaler.scale(loss).backward()
 			if step % self.grad_accumulation_steps == 0:
 				if self.max_grad_norm:
@@ -121,6 +123,8 @@ class Trainer:
 		else:
 			output = self.model(source, labels=target)
 			loss = output.loss
+			# Normalize the loss for the grad_accumulation_steps
+			loss = loss / self.grad_accumulation_steps
 			loss.backward()
 			if step % self.grad_accumulation_steps == 0:
 				# No need to unscale gradients here
@@ -132,7 +136,7 @@ class Trainer:
 				if self.lr_schedular:
 					self.lr_schedular.step()
 				self.optimizer.zero_grad()
-		return loss.item()
+		return loss.item() * self.grad_accumulation_steps
 
 	def _run_eval(self, source, target):
 		self.model.eval()
@@ -153,13 +157,13 @@ class Trainer:
 			TextColumn("[progress.description]{task.description}"),
 			BarColumn(),
 			TaskProgressColumn(),
-			"🏀",
+			"•",
 			TimeElapsedColumn(),
-			"🏀",
+			"•",
 			TimeRemainingColumn(),
-			"🏀",
+			"•",
 			TextColumn("[progress.percentage]{task.completed}"),
-			"🏀",
+			"•",
 			TextColumn(f"[progress.percentage]{total_steps:,}"),
 		) as progress:
 			training_task = progress.add_task(
@@ -176,14 +180,17 @@ class Trainer:
 					# Write to wandb
 					if self.report_to == "wandb":
 						metrics = {
-							"train/train_loss": loss,
+							"train/loss": loss,
 							"train/epoch": epoch,
 							"train/global_step": opt_step,
 							"train/learning_rate": self.optimizer.param_groups[0]["lr"],
 						}
 						wandb.log(metrics)
+					formatted_lr = self._format_float_to_str(
+						self.optimizer.param_groups[0]["lr"]
+					)
 					progress.console.log(
-						f"Epoch: {epoch}, Step: {opt_step}, Learning Rate: {self.optimizer.param_groups[0]['lr']:.6f}, Loss: {loss:.3f}"
+						f"Epoch: {epoch}, Step: {opt_step}, Learning Rate: {formatted_lr}, Loss: {loss:.3f}"
 					)
 					progress.update(training_task, advance=1, step=step)
 
@@ -225,17 +232,17 @@ class Trainer:
 								"Comparing all checkpoints since the max checkpoint limit has been reached"
 							)
 							# Delete the worst checkpoint
-							# Since the checkpoints are sorted by val_loss in an ascending order, 
+							# Since the checkpoints are sorted by val_loss in an ascending order,
 							# the last checkpoint is the worst checkpoint
-							worst_checkpoint_path = self.checkpoint_val_losses[-1]["ckp_path"]
+							worst_checkpoint_path = self.checkpoint_val_losses[-1][
+								"ckp_path"
+							]
 							path = self._delete_checkpoint(worst_checkpoint_path)
 							if path:
 								progress.console.log(
 									f"Deleted checkpoint at {self.checkpoint_val_losses.pop()['ckp_path']}"
 								)
 					progress.console.log("=" * 80)
-					
-								
 
 				step += 1
 
@@ -260,6 +267,14 @@ class Trainer:
 		self.checkpoint_val_losses = sorted(
 			self.checkpoint_val_losses, key=lambda x: x["val_loss"]
 		)
+
+	def _format_float_to_str(self, num: float) -> str:
+		"""
+		Format a float to a string
+		>>> _format_float_to_str(0.0003324) -> "3.324e-04"
+		>>> _format_float_to_str(0.00000283) -> "2.830e-06"
+		"""
+		return f"{num:.3e}".replace("e-0", "e-").replace("e+0", "e+").replace("e0", "e")
 
 	def train(
 		self,
@@ -287,7 +302,9 @@ class Trainer:
 			}
 			if wandb_project:
 				if wandb_run_name:
-					wandb.init(project=wandb_project, name=wandb_run_name, config=wandb_config)
+					wandb.init(
+						project=wandb_project, name=wandb_run_name, config=wandb_config
+					)
 				else:
 					wandb.init(project=wandb_project, config=wandb_config)
 			else:
