@@ -1,6 +1,6 @@
 from transformers import LlamaConfig
 
-from modelutils import get_llama_model
+from utils import get_llama_model
 
 
 def llama_1_7_model(seq_len: int = 1024):

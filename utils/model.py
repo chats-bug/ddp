@@ -1,14 +1,11 @@
 from rich.console import Console
-import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaConfig
-from typing import Union, Optional
+from typing import Optional
+
+from utils import num_trainable_params
 
 console = Console()
 LLAMA_TOKENIZER_PATH = "meta-llama/Llama-2-7b-hf"
-
-
-def num_trainable_params(model: torch.nn.Module):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def get_llama_model(config: Optional[LlamaConfig] = None):

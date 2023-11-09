@@ -1,14 +1,17 @@
-from typing import Optional
 import torch
 import torch.optim
 from rich.console import Console
 from rich.table import Table
 
-from datautils import get_dataset, CustomDataset, PoorMansDataLoader
+from utils import (
+    get_dataset,
+    CustomDataset,
+    PoorMansDataLoader,
+    num_trainable_params,
+    WarmupCosineWithDecay,
+)
 from model import llama_1_7_model, smaller_llama
-from modelutils import num_trainable_params
 from single_gpu import Trainer
-from optimutils import WarmupCosineWithDecay
 
 console = Console()
 
