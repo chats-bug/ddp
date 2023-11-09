@@ -1,4 +1,4 @@
-from typing import Union, Optional
+from typing import Union, Optional, Any
 import os
 import torch
 from rich.console import Console
@@ -11,15 +11,14 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 import wandb
-from tqdm import tqdm
 
-from datautils import PoorMansDataLoader
+from utils import PoorMansDataLoader, format_float_to_str
 
 console = Console()
 
 
 class Trainer:
-	checkpoint_val_losses: list[dict[str, float]] = []
+	checkpoint_val_losses: list[dict[str, Any]] = []
 
 	def __init__(
 			self,
@@ -64,7 +63,9 @@ class Trainer:
 		self.output_dir = output_dir
 		self.report_to = report_to
 		if self.device != "cuda":
-			self.gpu_id = self.device
+			# If the device is not cuda, then the gpu_id is the device
+			# This because the device is either "cpu" or probably a "mps" device
+			self.gpu_id = self.device  # type: ignore
 
 		# Set the
 		torch.set_default_device(self.device)
@@ -107,7 +108,7 @@ class Trainer:
 			self.scaler.scale(loss).backward()
 			if step % self.grad_accumulation_steps == 0:
 				if self.max_grad_norm:
-					# Unscales the gradients of optimizer's assigned parameters in-place
+					# Un-scale the gradients of optimizer's assigned parameters in-place
 					self.scaler.unscale_(self.optimizer)
 					# Since the gradients of optimizer's assigned parameters are now unscaled, clips as usual.
 					# You may use the same value for max_norm here as you would without gradient scaling.
@@ -150,6 +151,7 @@ class Trainer:
 		val_bsz = self.val_dataloader.get_batch_size()
 		total_steps = len(self.train_dataloader) // self.grad_accumulation_steps
 		step = 1
+
 		# Change the progress bar to add the following things:
 		# 1. Add the current step
 		# 2. Add the total number of steps
@@ -170,8 +172,9 @@ class Trainer:
 				"Training...",
 				total=len(self.train_dataloader) // self.grad_accumulation_steps,
 			)
+
 			for source, target in self.train_dataloader:
-				opt_step = step // self.grad_accumulation_steps
+				opt_step = step // self.grad_accumulation_steps + 1
 				self.model.train()
 				source = source.to(self.gpu_id)
 				target = target.to(self.gpu_id)
@@ -186,7 +189,7 @@ class Trainer:
 							"train/learning_rate": self.optimizer.param_groups[0]["lr"],
 						}
 						wandb.log(metrics)
-					formatted_lr = self._format_float_to_str(
+					formatted_lr = format_float_to_str(
 						self.optimizer.param_groups[0]["lr"]
 					)
 					progress.console.log(
@@ -232,9 +235,9 @@ class Trainer:
 								"Comparing all checkpoints since the max checkpoint limit has been reached"
 							)
 							# Delete the worst checkpoint
-							# Since the checkpoints are sorted by val_loss in an ascending order,
+							# Since the checkpoints are sorted by val_loss in ascending order,
 							# the last checkpoint is the worst checkpoint
-							worst_checkpoint_path = self.checkpoint_val_losses[-1][
+							worst_checkpoint_path: str = self.checkpoint_val_losses[-1][
 								"ckp_path"
 							]
 							path = self._delete_checkpoint(worst_checkpoint_path)
@@ -246,7 +249,7 @@ class Trainer:
 
 				step += 1
 
-	def _save_checkpoint(self, epoch: int, step: int, log_fn: callable):
+	def _save_checkpoint(self, epoch: int, step: int, log_fn):
 		ckp = self.model.state_dict()
 		ckp_path = f"{self.output_dir}/ckp_epoch_{epoch}_step_{step}.pt"
 		try:
@@ -268,21 +271,12 @@ class Trainer:
 			self.checkpoint_val_losses, key=lambda x: x["val_loss"]
 		)
 
-	def _format_float_to_str(self, num: float) -> str:
-		"""
-		Format a float to a string
-		>>> _format_float_to_str(0.0003324) -> "3.324e-04"
-		>>> _format_float_to_str(0.00000283) -> "2.830e-06"
-		"""
-		return f"{num:.3e}".replace("e-0", "e-").replace("e+0", "e+").replace("e0", "e")
-
 	def train(
 		self,
 		max_epochs: int,
 		wandb_project: Optional[str] = None,
 		wandb_run_name: Optional[str] = None,
 	):
-		self.val_losses = []
 		# Initialize wandb
 		if self.report_to == "wandb":
 			wandb_config = {
