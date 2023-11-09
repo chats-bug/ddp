@@ -5,12 +5,12 @@ import torch
 import wandb
 from rich.console import Console
 from rich.progress import (
-	Progress,
-	TextColumn,
-	BarColumn,
-	TaskProgressColumn,
-	TimeRemainingColumn,
-	TimeElapsedColumn,
+    Progress,
+    TextColumn,
+    BarColumn,
+    TaskProgressColumn,
+    TimeRemainingColumn,
+    TimeElapsedColumn,
 )
 
 from utils import PoorMansDataLoader, format_float_to_str
