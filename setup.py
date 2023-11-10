@@ -199,7 +199,7 @@ if __name__ == "__main__":
             optimizer,
             warmup_steps=int(args.warmup * num_steps // args.num_epochs),
             t_total=num_steps,
-            steps_per_epoch=len(train_dataloader),
+            steps_per_epoch=num_steps // args.num_epochs,
             eta_max=args.lr,
             eta_min=args.lr / args.min_lr_factor,
         )
