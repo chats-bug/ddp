@@ -59,8 +59,14 @@ class CustomDataset(Dataset):
         if self.packing:
             for data in self.dataset:
                 d = dict()
-                d["source"] = data["input_ids"][:-1]
-                d["target"] = data["input_ids"][1:]
+                # The input_ids are already shifted by one in huggingface's model forward
+                # >>> source = input_ids[:-1] and target = input_ids[1:]
+                # So we don't need to shift them here
+                # This behavior must be consistent with the model forward
+                # Change the model forward if you want to shift the input_ids here
+                # source and targets are shifted by one like below
+                d["source"] = data["input_ids"]
+                d["target"] = data["input_ids"]
                 yield d
         else:
             for data in self.hf_dataset:
@@ -72,8 +78,14 @@ class CustomDataset(Dataset):
                     truncation=self.trunctation,
                     return_tensors="pt",
                 )["input_ids"][0]
-                d["source"] = input_ids[:-1]
-                d["target"] = input_ids[1:]
+                # source and targets are shifted by one like below
+                # >>> source = input_ids[:-1] and target = input_ids[1:]
+                # The input_ids are already shifted by one in huggingface's model forward
+                # So we don't need to shift them here
+                # This behavior must be consistent with the model forward
+                # Change the model forward if you want to shift the input_ids here
+                d["source"] = input_ids
+                d["target"] = input_ids
                 yield d
 
 
@@ -101,37 +113,3 @@ class PoorMansDataLoader:
                 yield batch
                 batch = [[], []]
             counter += 1
-
-
-if __name__ == "__main__":
-    from transformers import AutoTokenizer
-
-    dataset = load_dataset("togethercomputer/RedPajama-Data-1T-Sample", split="train")
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    unpacked_dataset = CustomDataset(
-        hf_dataset=dataset,
-        tokenizer=tokenizer,
-        dataset_text_field="text",
-        seq_length=1024,
-        padding="max_length",
-        packing=False,
-    )
-    unpacked_dataloader = PoorMansDataLoader(unpacked_dataset, batch_size=2)
-
-    packed_dataset = CustomDataset(
-        hf_dataset=dataset,
-        tokenizer=tokenizer,
-        dataset_text_field="text",
-        seq_length=1024,
-        packing=True,
-    )
-    packed_dataloader = PoorMansDataLoader(packed_dataset, batch_size=2)
-
-    for source, target in packed_dataloader:
-        print(source.shape, target.shape)
-        break
-
-    for source, target in unpacked_dataloader:
-        print(source.shape, target.shape)
-        break
