@@ -174,12 +174,13 @@ class Trainer:
                 total=len(self.train_dataloader) // self.grad_accumulation_steps,
             )
 
+            loss = 0
             for source, target in self.train_dataloader:
                 opt_step = step // self.grad_accumulation_steps + 1
                 self.model.train()
                 source = source.to(self.gpu_id)
                 target = target.to(self.gpu_id)
-                loss = self._run_batch(source, target, step)
+                loss += self._run_batch(source, target, step) / self.grad_accumulation_steps
                 if step % (self.log_every * self.grad_accumulation_steps) == 0:
                     # Write to wandb
                     if self.report_to == "wandb":
@@ -197,6 +198,9 @@ class Trainer:
                         f"Epoch: {epoch}, Step: {opt_step}, Learning Rate: {formatted_lr}, Loss: {loss:.3f}"
                     )
                     progress.update(training_task, advance=1, step=step)
+                
+                if step % self.grad_accumulation_steps == 0:
+                    loss = 0
 
                 if step % (self.eval_every * self.grad_accumulation_steps) == 0:
                     self.model.eval()
