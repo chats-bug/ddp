@@ -19,12 +19,33 @@ def get_dataset(
 
 class CustomDataset(Dataset):
     def __init__(
-        self, hf_dataset: HFDataset, tokenizer, seq_len: int = 1024, **kwargs
+        self,
+        hf_dataset: HFDataset,
+        tokenizer,
+        dataset_text_field: Optional[str] = None,
+        seq_length: int = 1024,
+        packing: bool = True,
+        trunctation: bool = False,
+        padding: Optional[str] = None,
+        **kwargs,
     ) -> None:
         self.hf_dataset = hf_dataset
-        self.dataset = ConstantLengthDataset(
-            dataset=hf_dataset, tokenizer=tokenizer, seq_length=seq_len, **kwargs
-        )
+        self.tokenizer = tokenizer
+        self.dataset_text_field = dataset_text_field
+        self.seq_length = seq_length
+        self.packing = packing
+        self.trunctation = trunctation
+        self.padding = padding
+        self.kwargs = kwargs
+
+        if packing:
+            self.dataset = ConstantLengthDataset(
+                dataset=hf_dataset,
+                tokenizer=tokenizer,
+                seq_length=seq_length,
+                dataset_text_field=dataset_text_field,
+                **kwargs,
+            )
 
     def __len__(self) -> int:
         return len(self.hf_dataset)
@@ -34,11 +55,26 @@ class CustomDataset(Dataset):
         # CustomLengthDataset iterator returns {'input_ids': ..., 'labels': ...}
         # We want to return {'source': ..., 'target': ...}
         # where 'source' is the input_ids and 'target' is input_ids shifted by one
-        for data in self.dataset:
-            d = dict()
-            d["source"] = data["input_ids"][:-1]
-            d["target"] = data["input_ids"][1:]
-            yield d
+
+        if self.packing:
+            for data in self.dataset:
+                d = dict()
+                d["source"] = data["input_ids"][:-1]
+                d["target"] = data["input_ids"][1:]
+                yield d
+        else:
+            for data in self.hf_dataset:
+                d = dict()
+                input_ids = self.tokenizer(
+                    data[self.dataset_text_field],
+                    max_length=self.seq_length,
+                    padding=self.padding,
+                    truncation=self.trunctation,
+                    return_tensors="pt",
+                )["input_ids"][0]
+                d["source"] = input_ids[:-1]
+                d["target"] = input_ids[1:]
+                yield d
 
 
 class PoorMansDataLoader:
@@ -65,3 +101,37 @@ class PoorMansDataLoader:
                 yield batch
                 batch = [[], []]
             counter += 1
+
+
+if __name__ == "__main__":
+    from transformers import AutoTokenizer
+
+    dataset = load_dataset("togethercomputer/RedPajama-Data-1T-Sample", split="train")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    unpacked_dataset = CustomDataset(
+        hf_dataset=dataset,
+        tokenizer=tokenizer,
+        dataset_text_field="text",
+        seq_length=1024,
+        padding="max_length",
+        packing=False,
+    )
+    unpacked_dataloader = PoorMansDataLoader(unpacked_dataset, batch_size=2)
+
+    packed_dataset = CustomDataset(
+        hf_dataset=dataset,
+        tokenizer=tokenizer,
+        dataset_text_field="text",
+        seq_length=1024,
+        packing=True,
+    )
+    packed_dataloader = PoorMansDataLoader(packed_dataset, batch_size=2)
+
+    for source, target in packed_dataloader:
+        print(source.shape, target.shape)
+        break
+
+    for source, target in unpacked_dataloader:
+        print(source.shape, target.shape)
+        break
