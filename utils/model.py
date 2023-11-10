@@ -2,7 +2,7 @@ from rich.console import Console
 from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaConfig
 from typing import Optional
 
-from utils import num_trainable_params
+from .utils import num_trainable_params
 
 console = Console()
 LLAMA_TOKENIZER_PATH = "meta-llama/Llama-2-7b-hf"
