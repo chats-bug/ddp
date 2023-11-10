@@ -180,7 +180,9 @@ class Trainer:
                 self.model.train()
                 source = source.to(self.gpu_id)
                 target = target.to(self.gpu_id)
-                loss += self._run_batch(source, target, step) / self.grad_accumulation_steps
+                loss += (
+                    self._run_batch(source, target, step) / self.grad_accumulation_steps
+                )
                 if step % (self.log_every * self.grad_accumulation_steps) == 0:
                     # Write to wandb
                     if self.report_to == "wandb":
