@@ -24,7 +24,7 @@ class WarmupCosineWithDecay(torch.optim.lr_scheduler.LambdaLR):
 
     def lr_lambda(self, step):
         step = step % self.steps_per_epoch
-
+        
         if step < self.warmup_steps:
             return float(step) / float(max(1, self.warmup_steps))
         else:
@@ -41,3 +41,26 @@ class WarmupCosineWithDecay(torch.optim.lr_scheduler.LambdaLR):
                     )
                 )
             ) / self.eta_max
+
+
+if __name__ == "__main__":
+    model = torch.nn.Linear(10, 10)
+    lr_scheular = WarmupCosineWithDecay(
+        optimizer=torch.optim.AdamW(
+            model.parameters(),
+            lr=1e-4,
+            weight_decay=1e-2,
+            betas=(0.9, 0.999),
+            eps=1e-6,
+        ),
+        warmup_steps=2,
+        t_total=20,
+        steps_per_epoch=10,
+        eta_max=1,
+        eta_min=0.1,
+    )
+
+    for epoch in range(2):
+        for step in range(10):
+            lr_scheular.step()
+            print(lr_scheular.get_last_lr()[0])

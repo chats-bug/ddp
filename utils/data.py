@@ -19,12 +19,33 @@ def get_dataset(
 
 class CustomDataset(Dataset):
     def __init__(
-        self, hf_dataset: HFDataset, tokenizer, seq_len: int = 1024, **kwargs
+        self,
+        hf_dataset: HFDataset,
+        tokenizer,
+        dataset_text_field: Optional[str] = None,
+        seq_length: int = 1024,
+        packing: bool = True,
+        trunctation: bool = False,
+        padding: Optional[str] = None,
+        **kwargs,
     ) -> None:
         self.hf_dataset = hf_dataset
-        self.dataset = ConstantLengthDataset(
-            dataset=hf_dataset, tokenizer=tokenizer, seq_length=seq_len, **kwargs
-        )
+        self.tokenizer = tokenizer
+        self.dataset_text_field = dataset_text_field
+        self.seq_length = seq_length
+        self.packing = packing
+        self.trunctation = trunctation
+        self.padding = padding
+        self.kwargs = kwargs
+
+        if packing:
+            self.dataset = ConstantLengthDataset(
+                dataset=hf_dataset,
+                tokenizer=tokenizer,
+                seq_length=seq_length,
+                dataset_text_field=dataset_text_field,
+                **kwargs,
+            )
 
     def __len__(self) -> int:
         return len(self.hf_dataset)
@@ -34,11 +55,38 @@ class CustomDataset(Dataset):
         # CustomLengthDataset iterator returns {'input_ids': ..., 'labels': ...}
         # We want to return {'source': ..., 'target': ...}
         # where 'source' is the input_ids and 'target' is input_ids shifted by one
-        for data in self.dataset:
-            d = dict()
-            d["source"] = data["input_ids"][:-1]
-            d["target"] = data["input_ids"][1:]
-            yield d
+
+        if self.packing:
+            for data in self.dataset:
+                d = dict()
+                # The input_ids are already shifted by one in huggingface's model forward
+                # >>> source = input_ids[:-1] and target = input_ids[1:]
+                # So we don't need to shift them here
+                # This behavior must be consistent with the model forward
+                # Change the model forward if you want to shift the input_ids here
+                # source and targets are shifted by one like below
+                d["source"] = data["input_ids"]
+                d["target"] = data["input_ids"]
+                yield d
+        else:
+            for data in self.hf_dataset:
+                d = dict()
+                input_ids = self.tokenizer(
+                    data[self.dataset_text_field],
+                    max_length=self.seq_length,
+                    padding=self.padding,
+                    truncation=self.trunctation,
+                    return_tensors="pt",
+                )["input_ids"][0]
+                # source and targets are shifted by one like below
+                # >>> source = input_ids[:-1] and target = input_ids[1:]
+                # The input_ids are already shifted by one in huggingface's model forward
+                # So we don't need to shift them here
+                # This behavior must be consistent with the model forward
+                # Change the model forward if you want to shift the input_ids here
+                d["source"] = input_ids
+                d["target"] = input_ids
+                yield d
 
 
 class PoorMansDataLoader:

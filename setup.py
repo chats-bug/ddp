@@ -2,6 +2,7 @@ import torch
 import torch.optim
 from rich.console import Console
 from rich.table import Table
+import os
 
 from model import llama_1_7_model, smaller_llama
 from single_gpu import Trainer
@@ -17,8 +18,10 @@ console = Console()
 
 DATASET_NAME = "togethercomputer/RedPajama-Data-1T-Sample"
 VAL_SIZE = 0.001
-SEQ_LEN = 512
+SEQ_LENGTH = 512
 BATCH_SIZE = 8
+PADDING = "max_length"
+DATASET_TEXT_FIELD = "text"
 LR = 3e-4
 WEIGHT_DECAY = 0.1
 NUM_EPOCHS = 1
@@ -32,7 +35,7 @@ GPU_ID = 0
 SMALLER = False
 MAX_GRAD_NORM = None
 REPORT_TO = None
-WANDB_PROJECT = "pytorch-training"
+WANDB_PROJECT = os.environ.get("WANDB_PROJECT", None)
 WANDB_RUN = None
 ANNEAL_STRATEGY = "cos"
 WARMUP_STEPS = 0.1
@@ -44,7 +47,11 @@ def parse_args():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--small_model", action=argparse.BooleanOptionalAction)
-    parser.add_argument("--seq_len", type=int, default=SEQ_LEN)
+    parser.add_argument("--seq_len", type=int, default=SEQ_LENGTH)
+    parser.add_argument("--packing", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--truncation", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--padding", type=str, default=PADDING)
+    parser.add_argument("--dataset_text_field", type=str, default=DATASET_TEXT_FIELD)
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--warmup", type=float, default=WARMUP_STEPS)
@@ -73,7 +80,11 @@ def parse_args():
 
 def load_train_objs(
     dataset: str,
-    seq_len: int,
+    dataset_text_field: str,
+    seq_length: int,
+    packing: bool,
+    truncation: bool,
+    padding: str,
     lr: float,
     weight_decay: float,
     smaller_model: bool = False,
@@ -89,18 +100,31 @@ def load_train_objs(
 
     console.log("Loading model and tokenizer...")
     if smaller_model:
-        packed_obj = smaller_llama(seq_len)
+        packed_obj = smaller_llama(seq_length)
     else:
-        packed_obj = llama_1_7_model(seq_len)
+        packed_obj = llama_1_7_model(seq_length)
     model = packed_obj["model"]
     tokenizer = packed_obj["tokenizer"]
+    tokenizer.add_special_tokens({'pad_token': '[PAD]'})  # Add a new special token for padding
 
     console.log("Making custom dataset...")
     train_dataset = CustomDataset(
-        train_dataset, tokenizer, seq_len=seq_len, dataset_text_field="text"
+        hf_dataset=train_dataset,
+        tokenizer=tokenizer,
+        seq_length=seq_length,
+        dataset_text_field=dataset_text_field,
+        packing=packing,
+        padding=padding,
+        trunctation=truncation,
     )
     val_dataset = CustomDataset(
-        val_dataset, tokenizer, seq_len=seq_len, dataset_text_field="text"
+        hf_dataset=train_dataset,
+        tokenizer=tokenizer,
+        seq_length=seq_length,
+        dataset_text_field=dataset_text_field,
+        packing=packing,
+        padding=padding,
+        trunctation=truncation,
     )
 
     console.log("Setting up optimizer...")
@@ -151,7 +175,11 @@ def main(args):
     # model, tokenizer and optimizer
     train_dataset, val_dataset, model, tokenizer, optimizer = load_train_objs(
         dataset=args.dataset_name,
-        seq_len=args.seq_len,
+        seq_length=args.seq_len,
+        dataset_text_field=args.dataset_text_field,
+        packing=args.packing,
+        truncation=args.truncation,
+        padding=args.padding,
         lr=args.lr,
         weight_decay=args.weight_decay,
         smaller_model=args.small_model,
@@ -169,7 +197,7 @@ def main(args):
             optimizer,
             warmup_steps=int(args.warmup * num_steps // args.num_epochs),
             t_total=num_steps,
-            steps_per_epoch=len(train_dataloader),
+            steps_per_epoch=num_steps // args.num_epochs,
             eta_max=args.lr,
             eta_min=args.lr / args.min_lr_factor,
         )
@@ -215,7 +243,11 @@ def log_arguments(args, model, optimizer, lr_scheduler, device, torch_dtype, num
     table.add_row("Model Type", str(model.config.model_type))
     table.add_row("Model Size", f"{(num_trainable_params(model) / 1e9):.2f}B")
     table.add_row("Dataset", str(args.dataset_name))
+    table.add_row("Dataset Text Field", str(args.dataset_text_field))
+    table.add_row("Packing", str(args.packing))
     table.add_row("Sequence Length", str(args.seq_len))
+    table.add_row("Truncation", str(args.truncation))
+    table.add_row("Padding", str(args.padding))
 
     table.add_row("", "")
     table.add_row("-------------------", "-------------------")
