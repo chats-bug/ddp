@@ -1,8 +1,9 @@
-from datasets import load_dataset, Dataset as HFDataset
-from typing import Optional, Union, Dict, List, Tuple
-from torch.utils.data import Dataset
-from trl.trainer.utils import ConstantLengthDataset
+from typing import Optional
+
 import torch
+from datasets import load_dataset, Dataset as HFDataset
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from trl.trainer.utils import ConstantLengthDataset
 
 
 def get_dataset(
@@ -25,7 +26,7 @@ class CustomDataset(Dataset):
         dataset_text_field: Optional[str] = None,
         seq_length: int = 1024,
         packing: bool = True,
-        trunctation: bool = False,
+        truncation: bool = False,
         padding: Optional[str] = None,
         **kwargs,
     ) -> None:
@@ -34,7 +35,7 @@ class CustomDataset(Dataset):
         self.dataset_text_field = dataset_text_field
         self.seq_length = seq_length
         self.packing = packing
-        self.trunctation = trunctation
+        self.truncation = truncation
         self.padding = padding
         self.kwargs = kwargs
 
@@ -75,7 +76,7 @@ class CustomDataset(Dataset):
                     data[self.dataset_text_field],
                     max_length=self.seq_length,
                     padding=self.padding,
-                    truncation=self.trunctation,
+                    truncation=self.truncation,
                     return_tensors="pt",
                 )["input_ids"][0]
                 # source and targets are shifted by one like below
@@ -113,3 +114,27 @@ class PoorMansDataLoader:
                 yield batch
                 batch = [[], []]
             counter += 1
+
+
+def get_ddp_dataloader(
+    dataset: Dataset,
+    tokenizer,
+    dataset_text_field: Optional[str] = None,
+    seq_length: int = 1024,
+    batch_size: int = 8,
+    **kwargs,
+):
+    packed_dataset = ConstantLengthDataset(
+        dataset=dataset,
+        tokenizer=tokenizer,
+        seq_length=seq_length,
+        dataset_text_field=dataset_text_field,
+    )
+    dataloader = DataLoader(
+        packed_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=DistributedSampler(packed_dataset),
+        **kwargs,
+    )
+    return dataloader
