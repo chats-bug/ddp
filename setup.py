@@ -3,6 +3,8 @@ import torch.optim
 from rich.console import Console
 from rich.table import Table
 
+from model import llama_1_7_model, smaller_llama
+from single_gpu import Trainer
 from utils import (
     get_dataset,
     CustomDataset,
@@ -10,8 +12,6 @@ from utils import (
     num_trainable_params,
     WarmupCosineWithDecay,
 )
-from model import llama_1_7_model, smaller_llama
-from single_gpu import Trainer
 
 console = Console()
 
@@ -112,9 +112,7 @@ def prepare_dataloader(dataset: CustomDataset, batch_size: int):
     return PoorMansDataLoader(dataset, batch_size=batch_size)
 
 
-if __name__ == "__main__":
-    args = parse_args()
-
+def main(args):
     # Setting the device
     # Using GPUs significantly speeds up the training process
     # as well as inference
@@ -180,6 +178,8 @@ if __name__ == "__main__":
         console.log("Not using a learning rate scheduler")
         lr_scheduler = None
 
+    log_arguments(args, model, optimizer, lr_scheduler, device, torch_dtype, num_steps)
+
     trainer = Trainer(
         model=model,
         train_dataloader=train_dataloader,
@@ -198,6 +198,14 @@ if __name__ == "__main__":
         report_to=args.report_to,
     )
 
+    trainer.train(
+        max_epochs=args.num_epochs,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run,
+    )
+
+
+def log_arguments(args, model, optimizer, lr_scheduler, device, torch_dtype, num_steps):
     # Print all the important model, data and training parameters
     table = Table(title="Training Parameters")
     table.add_column("Parameter")
@@ -253,8 +261,9 @@ if __name__ == "__main__":
     console.print(table)
 
     console.log(f"Starting training with {device} using {torch_dtype}...")
-    trainer.train(
-        max_epochs=args.num_epochs,
-        wandb_project=args.wandb_project,
-        wandb_run_name=args.wandb_run,
-    )
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    main(args)
