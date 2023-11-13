@@ -1,5 +1,7 @@
 import torch
 import torch.optim
+import torch.multiprocessing as mp
+from torch.distributed import init_process_group, destroy_process_group
 from rich.console import Console
 from rich.table import Table
 import os
@@ -12,6 +14,7 @@ from utils import (
     PoorMansDataLoader,
     num_trainable_params,
     WarmupCosineWithDecay,
+    get_ddp_dataloader,
 )
 
 console = Console()
@@ -40,6 +43,15 @@ WANDB_RUN = None
 ANNEAL_STRATEGY = "cos"
 WARMUP_STEPS = 0.1
 MIN_LR_FACTOR = 10
+DDP = True
+
+
+def ddp_setup(rank, world_size):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+
+    # initialize the process group
+    init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
 
 def parse_args():
@@ -99,13 +111,15 @@ def load_train_objs(
     val_dataset = hf_dataset["test"]
 
     console.log("Loading model and tokenizer...")
+    # Add special tokens here
+    # - PAD token is a special token that is used for padding
+    special_tokens = {"pad_token": "[PAD]"}
     if smaller_model:
-        packed_obj = smaller_llama(seq_length)
+        packed_obj = smaller_llama(seq_length, special_tokens)
     else:
-        packed_obj = llama_1_7_model(seq_length)
+        packed_obj = llama_1_7_model(seq_length, special_tokens)
     model = packed_obj["model"]
     tokenizer = packed_obj["tokenizer"]
-    tokenizer.add_special_tokens({'pad_token': '[PAD]'})  # Add a new special token for padding
 
     console.log("Making custom dataset...")
     train_dataset = CustomDataset(
@@ -118,13 +132,13 @@ def load_train_objs(
         trunctation=truncation,
     )
     val_dataset = CustomDataset(
-        hf_dataset=train_dataset,
+        hf_dataset=val_dataset,
         tokenizer=tokenizer,
         seq_length=seq_length,
         dataset_text_field=dataset_text_field,
         packing=packing,
         padding=padding,
-        trunctation=truncation,
+        truncation=truncation,
     )
 
     console.log("Setting up optimizer...")
@@ -136,7 +150,9 @@ def prepare_dataloader(dataset: CustomDataset, batch_size: int):
     return PoorMansDataLoader(dataset, batch_size=batch_size)
 
 
-def main(args):
+def main(args, rank: int, world_size: int):
+    ddp_setup(rank, world_size)
+
     # Setting the device
     # Using GPUs significantly speeds up the training process
     # as well as inference
@@ -185,10 +201,32 @@ def main(args):
         smaller_model=args.small_model,
     )
 
-    # DataLoaders process the datasets
-    # and provide an iterator
-    train_dataloader = prepare_dataloader(train_dataset, batch_size=args.batch_size)
-    val_dataloader = prepare_dataloader(val_dataset, batch_size=args.batch_size)
+    if DDP:
+        # TODO:
+        # This is a temporary fix
+        # This should be handled by the data and training utils
+        hf_dataset = get_dataset(args.dataset_name, split="train")
+        hf_dataset = hf_dataset.shuffle()
+        hf_dataset = hf_dataset.train_test_split(test_size=VAL_SIZE)
+        train_dataloader = get_ddp_dataloader(
+            hf_dataset["train"],
+            tokenizer,
+            seq_length=args.seq_len,
+            dataset_text_field=args.dataset_text_field,
+            batch_size=args.batch_size,
+        )
+        val_dataloader = get_ddp_dataloader(
+            hf_dataset["test"],
+            tokenizer,
+            seq_length=args.seq_len,
+            dataset_text_field=args.dataset_text_field,
+            batch_size=args.batch_size,
+        )
+    else:
+        # DataLoaders process the datasets
+        # and provide an iterator
+        train_dataloader = prepare_dataloader(train_dataset, batch_size=args.batch_size)
+        val_dataloader = prepare_dataloader(val_dataset, batch_size=args.batch_size)
 
     # Number of steps is used for the learning rate scheduler
     num_steps = len(train_dataloader) * args.num_epochs // args.grad_accumulation_steps
@@ -214,7 +252,8 @@ def main(args):
         val_dataloader=val_dataloader,
         optimizer=optimizer,
         lr_schedular=lr_scheduler,
-        gpu_id=args.gpu_id,
+        # gpu_id=args.gpu_id,
+        gpu_id=args.rank,
         device=device,
         eval_every=args.eval_every,
         save_every=args.save_every,
@@ -297,5 +336,13 @@ def log_arguments(args, model, optimizer, lr_scheduler, device, torch_dtype, num
 
 if __name__ == "__main__":
     args = parse_args()
-
+    world_size = torch.cuda.device_count()
+    mp.spawn(
+        main,
+        args=(
+            args,
+            world_size,
+        ),
+        nprocs=world_size,
+    )
     main(args)

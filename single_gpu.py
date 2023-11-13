@@ -12,10 +12,12 @@ from rich.progress import (
     TimeRemainingColumn,
     TimeElapsedColumn,
 )
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from utils import PoorMansDataLoader, format_float_to_str
 
 console = Console()
+DDP = True
 
 
 class Trainer:
@@ -91,6 +93,10 @@ class Trainer:
                 torch.set_default_dtype(self.torch_dtype)
             else:
                 self.scaler = torch.cuda.amp.GradScaler(enabled=True)
+
+        # Wrap the model with DDP if the device is cuda
+        self.model.to(self.gpu_id)
+        self.model = DDP(self.model, device_ids=[self.gpu_id])
 
         if not self.output_dir:
             self.output_dir = "output"
@@ -175,7 +181,12 @@ class Trainer:
             )
 
             loss = 0
-            for source, target in self.train_dataloader:
+            for data in self.train_dataloader:
+                source = data["source"]
+                target = data["target"]
+                if DDP:
+                    source = data["input_ids"]
+                    target = data["input_ids"]
                 opt_step = step // self.grad_accumulation_steps + 1
                 self.model.train()
                 source = source.to(self.gpu_id)
@@ -200,7 +211,7 @@ class Trainer:
                         f"Epoch: {epoch}, Step: {opt_step}, Learning Rate: {formatted_lr}, Loss: {loss:.3f}"
                     )
                     progress.update(training_task, advance=1, step=step)
-                
+
                 if step % self.grad_accumulation_steps == 0:
                     loss = 0
 
@@ -226,7 +237,10 @@ class Trainer:
                     progress.console.log(
                         f"Epoch: {epoch}, Step: {opt_step}, Val loss: {val_loss:.4f}"
                     )
-                    if step % (self.save_every * self.grad_accumulation_steps) == 0:
+                    if (
+                        step % (self.save_every * self.grad_accumulation_steps) == 0
+                        and self.gpu_id == 0
+                    ):
                         path = self._save_checkpoint(
                             epoch, opt_step, progress.console.log
                         )
@@ -257,7 +271,7 @@ class Trainer:
                 step += 1
 
     def _save_checkpoint(self, epoch: int, step: int, log_fn):
-        ckp = self.model.state_dict()
+        ckp = self.model.module.state_dict()
         ckp_path = f"{self.output_dir}/ckp_epoch_{epoch}_step_{step}.pt"
         try:
             torch.save(ckp, ckp_path)
@@ -311,8 +325,6 @@ class Trainer:
             else:
                 wandb.init(config=wandb_config)
 
-        print(f"Transferring model to {self.gpu_id}...")
-        self.model.to(self.gpu_id)
         for epoch in range(max_epochs):
             self._run_epoch(epoch)
 
