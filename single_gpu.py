@@ -12,10 +12,27 @@ from rich.progress import (
     TimeRemainingColumn,
     TimeElapsedColumn,
 )
+from torch.distributed import init_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from utils import PoorMansDataLoader, format_float_to_str
 
 console = Console()
+
+
+def ddp_setup(rank, world_size, gpu_id, backend="nccl"):
+    """
+    A function to setup the distributed data parallel
+    Args:
+        - `rank`: The rank of the current process
+        - `world_size`: The total number of processes
+        - `gpu_id`: ID of the GPU to use
+        - `backend`: Backend to use for the distributed data parallel
+    :return:
+    """
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    init_process_group(backend=backend, rank=rank, world_size=world_size)
 
 
 class Trainer:
@@ -68,9 +85,6 @@ class Trainer:
             # This because the device is either "cpu" or probably a "mps" device
             self.gpu_id = self.device  # type: ignore
 
-        # Set the
-        torch.set_default_device(self.device)
-
         self.scaler = None
         if self.torch_dtype != torch.float32:
             # assert self.device in ["cpu", "cuda", torch.device("cpu"), torch.device("cuda")], \
@@ -92,6 +106,10 @@ class Trainer:
             else:
                 self.scaler = torch.cuda.amp.GradScaler(enabled=True)
 
+        # Setup for distributed data parallel
+        self.model.to(self.gpu_id)
+        self.model = DDP(self.model, device_ids=[self.gpu_id])
+
         if not self.output_dir:
             self.output_dir = "output"
         if not os.path.exists(self.output_dir):
@@ -109,9 +127,9 @@ class Trainer:
             self.scaler.scale(loss).backward()
             if step % self.grad_accumulation_steps == 0:
                 if self.max_grad_norm:
-                    # Un-scale the gradients of optimizer's assigned parameters in-place
+                    # Un-scale the gradients of optimizer assigned parameters in-place
                     self.scaler.unscale_(self.optimizer)
-                    # Since the gradients of optimizer's assigned parameters are now unscaled, clips as usual.
+                    # Since the gradients of optimizer assigned parameters are now unscaled, clips as usual.
                     # You may use the same value for max_norm here as you would without gradient scaling.
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), max_norm=self.max_grad_norm
@@ -185,7 +203,7 @@ class Trainer:
                     if self.report_to == "wandb":
                         metrics = {
                             "train/loss": loss,
-                            "train/epoch": epoch,
+                            "train/epoch": epoch + round(opt_step / total_steps, 2),
                             "train/global_step": opt_step,
                             "train/learning_rate": self.optimizer.param_groups[0]["lr"],
                         }
@@ -220,7 +238,10 @@ class Trainer:
                     progress.console.log(
                         f"Epoch: {epoch}, Step: {opt_step}, Val loss: {val_loss:.4f}"
                     )
-                    if step % (self.save_every * self.grad_accumulation_steps) == 0:
+
+                    if (
+                        step % (self.save_every * self.grad_accumulation_steps) == 0
+                    ) and self.gpu_id == 0:
                         path = self._save_checkpoint(
                             epoch, opt_step, progress.console.log
                         )
@@ -251,7 +272,7 @@ class Trainer:
                 step += 1
 
     def _save_checkpoint(self, epoch: int, step: int, log_fn):
-        ckp = self.model.state_dict()
+        ckp = self.model.module.state_dict()
         ckp_path = f"{self.output_dir}/ckp_epoch_{epoch}_step_{step}.pt"
         try:
             torch.save(ckp, ckp_path)
@@ -261,7 +282,8 @@ class Trainer:
             log_fn(f"Error saving checkpoint: {e}")
             return None
 
-    def _delete_checkpoint(self, ckp_path: str):
+    @staticmethod
+    def _delete_checkpoint(ckp_path: str):
         if os.path.exists(ckp_path):
             os.remove(ckp_path)
             return ckp_path
@@ -305,8 +327,6 @@ class Trainer:
             else:
                 wandb.init(config=wandb_config)
 
-        print(f"Transferring model to {self.gpu_id}...")
-        self.model.to(self.gpu_id)
         for epoch in range(max_epochs):
             self._run_epoch(epoch)
 
