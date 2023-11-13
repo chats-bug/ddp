@@ -3,7 +3,7 @@ from transformers import LlamaConfig
 from utils import get_llama_model
 
 
-def llama_1_7_model(seq_len: int = 1024):
+def llama_1_7_model(seq_len: int = 1024, special_tokens: dict = None):
     config = LlamaConfig(
         vocab_size=32000,
         hidden_size=2048,
@@ -25,10 +25,10 @@ def llama_1_7_model(seq_len: int = 1024):
         rope_scaling=None,
         attention_bias=False,
     )
-    return get_llama_model(config)
+    return get_llama_model(config, special_tokens)
 
 
-def smaller_llama(seq_len: int = 512):
+def smaller_llama(seq_len: int = 512, special_tokens: dict = None):
     config = LlamaConfig(
         vocab_size=32000,
         hidden_size=512,
@@ -50,4 +50,4 @@ def smaller_llama(seq_len: int = 512):
         rope_scaling=None,
         attention_bias=False,
     )
-    return get_llama_model(config)
+    return get_llama_model(config, special_tokens)

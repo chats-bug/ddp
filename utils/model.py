@@ -1,6 +1,7 @@
+from typing import Optional
+
 from rich.console import Console
 from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaConfig
-from typing import Optional
 
 from .utils import num_trainable_params
 
@@ -8,14 +9,20 @@ console = Console()
 LLAMA_TOKENIZER_PATH = "meta-llama/Llama-2-7b-hf"
 
 
-def get_llama_model(config: Optional[LlamaConfig] = None):
+def get_llama_model(
+    config: Optional[LlamaConfig] = None, special_tokens: Optional[dict] = None
+):
     assert isinstance(config, LlamaConfig), "Only LlamaConfig is supported for now"
+
+    tokenizer = AutoTokenizer.from_pretrained(LLAMA_TOKENIZER_PATH)
+    if special_tokens:
+        tokenizer.add_special_tokens(special_tokens)
 
     if config is None:
         # warn the user that the default config is used
         console.log("No config is provided, using the default config", style="bold red")
         config = LlamaConfig(
-            vocab_size=32000,
+            vocab_size=tokenizer.voacab_size,
             hidden_size=4096,
             intermediate_size=11008,
             num_hidden_layers=32,
@@ -40,5 +47,4 @@ def get_llama_model(config: Optional[LlamaConfig] = None):
         console.log(f"Model Size: {num_trainable_params(model)}", style="bold red")
     else:
         model = AutoModelForCausalLM.from_config(config)
-    tokenizer = AutoTokenizer.from_pretrained(LLAMA_TOKENIZER_PATH)
     return {"model": model, "tokenizer": tokenizer}
