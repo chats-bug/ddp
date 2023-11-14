@@ -1,5 +1,5 @@
-from typing import Optional
-
+from typing import Optional, Union
+import multiprocess as mp
 import torch
 from datasets import load_dataset, Dataset as HFDataset
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
@@ -18,123 +18,87 @@ def get_dataset(
     return load_dataset(data_path, split=split, **kwargs)
 
 
-class CustomDataset(Dataset):
-    def __init__(
-        self,
-        hf_dataset: HFDataset,
-        tokenizer,
-        dataset_text_field: Optional[str] = None,
-        seq_length: int = 1024,
-        packing: bool = True,
-        truncation: bool = False,
-        padding: Optional[str] = None,
-        **kwargs,
-    ) -> None:
-        self.hf_dataset = hf_dataset
-        self.tokenizer = tokenizer
-        self.dataset_text_field = dataset_text_field
-        self.seq_length = seq_length
-        self.packing = packing
-        self.truncation = truncation
-        self.padding = padding
-        self.kwargs = kwargs
-
-        if packing:
-            self.dataset = ConstantLengthDataset(
-                dataset=hf_dataset,
-                tokenizer=tokenizer,
-                seq_length=seq_length,
-                dataset_text_field=dataset_text_field,
-                **kwargs,
-            )
-
-    def __len__(self) -> int:
-        return len(self.hf_dataset)
-
-    def __iter__(self):
-        # The iterator of the custom dataset is the iterator of the constant length dataset
-        # CustomLengthDataset iterator returns {'input_ids': ..., 'labels': ...}
-        # We want to return {'source': ..., 'target': ...}
-        # where 'source' is the input_ids and 'target' is input_ids shifted by one
-
-        if self.packing:
-            for data in self.dataset:
-                d = dict()
-                # The input_ids are already shifted by one in huggingface's model forward
-                # >>> source = input_ids[:-1] and target = input_ids[1:]
-                # So we don't need to shift them here
-                # This behavior must be consistent with the model forward
-                # Change the model forward if you want to shift the input_ids here
-                # source and targets are shifted by one like below
-                d["source"] = data["input_ids"]
-                d["target"] = data["input_ids"]
-                yield d
-        else:
-            for data in self.hf_dataset:
-                d = dict()
-                input_ids = self.tokenizer(
-                    data[self.dataset_text_field],
-                    max_length=self.seq_length,
-                    padding=self.padding,
-                    truncation=self.truncation,
-                    return_tensors="pt",
-                )["input_ids"][0]
-                # source and targets are shifted by one like below
-                # >>> source = input_ids[:-1] and target = input_ids[1:]
-                # The input_ids are already shifted by one in huggingface's model forward
-                # So we don't need to shift them here
-                # This behavior must be consistent with the model forward
-                # Change the model forward if you want to shift the input_ids here
-                d["source"] = input_ids
-                d["target"] = input_ids
-                yield d
-
-
-class PoorMansDataLoader:
-    def __init__(self, dataset: CustomDataset, batch_size: int = 8):
-        self.dataset = dataset
-        self.batch_size = batch_size
-
-    def __len__(self) -> int:
-        return len(self.dataset) // self.batch_size
-
-    def get_batch_size(self) -> int:
-        return self.batch_size
-
-    def __iter__(self):
-        counter = 1
-        batch = [[], []]
-        for data in self.dataset:
-            batch[0].append(data["source"])
-            batch[1].append(data["target"])
-            if counter % self.batch_size == 0:
-                # convert batch to torch.tensor
-                batch[0] = torch.stack(batch[0])
-                batch[1] = torch.stack(batch[1])
-                yield batch
-                batch = [[], []]
-            counter += 1
-
-
-def get_ddp_dataloader(
-    dataset: Dataset,
+def prepare_dataset(
+    hf_dataset: HFDataset,
     tokenizer,
     dataset_text_field: Optional[str] = None,
     seq_length: int = 1024,
+    packing: bool = True,
+    truncation: bool = False,
+    padding: Optional[str] = None,
+    formatting_func=None,
     batch_size: int = 8,
+    *args,
     **kwargs,
-):
-    packed_dataset = ConstantLengthDataset(
-        dataset=dataset,
-        tokenizer=tokenizer,
-        seq_length=seq_length,
-        dataset_text_field=dataset_text_field,
+) -> Union[HFDataset, ConstantLengthDataset]:
+    if packing:
+        return ConstantLengthDataset(
+            dataset=hf_dataset,
+            tokenizer=tokenizer,
+            seq_length=seq_length,
+            dataset_text_field=dataset_text_field,
+            *args,
+            **kwargs,
+        )
+    else:
+        use_formatting_func = formatting_func is not None and dataset_text_field is not None
+        def tokenize(element):
+            outputs = tokenizer(
+                element[dataset_text_field] if not use_formatting_func else formatting_func(element),
+                truncation=truncation,
+                padding=padding,
+                max_length=seq_length,
+                return_overflowing_tokens=False,
+                return_length=False,
+                return_tensors="pt",
+            )
+
+            if use_formatting_func:
+                if not isinstance(formatting_func(element), list):
+                    raise ValueError(
+                        "The `formatting_func` should return a list of processed strings since it can lead to silent bugs."
+                    )
+
+            return {"input_ids": outputs["input_ids"], "attention_mask": outputs["attention_mask"]}
+        
+        max_workers = None
+        if "dataset_num_proc" in kwargs:
+            max_workers = kwargs.pop("dataset_num_proc")
+        print(f"Using {max_workers} workers to tokenize the dataset")
+        return hf_dataset.map(
+            tokenize,
+            batched=True,
+            remove_columns=hf_dataset.column_names,
+            num_proc=max_workers,
+            batch_size=batch_size,
+            *args,
+            **kwargs,
+        )
+
+
+if __name__ == "__main__":
+    dataset_name = "roneneldan/TinyStories"
+    dataset = get_dataset(dataset_name, split="train")
+    dataset = dataset.select(range(100_000))
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+    tokenizer.pad_token = tokenizer.eos_token
+
+    dataset = prepare_dataset(
+        dataset, 
+        tokenizer, 
+        dataset_text_field="text", 
+        seq_length=1024, 
+        packing=False, 
+        truncation=True, 
+        padding="max_length", 
+        batch_size=8, 
+        dataset_num_proc=16
     )
-    dataloader = DataLoader(
-        packed_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        sampler=DistributedSampler(packed_dataset),
-        **kwargs,
-    )
-    return dataloader
+
+    for batch in dataset:
+        print(batch)
+        print(batch['input_ids'].shape)
+        break
+
