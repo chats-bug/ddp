@@ -2,6 +2,7 @@ import torch
 import torch.optim
 import torch.multiprocessing as mp
 from torch.distributed import init_process_group, destroy_process_group
+from torch.utils.data import DataLoader, DistributedSampler
 from rich.console import Console
 from rich.table import Table
 import os
@@ -10,11 +11,9 @@ from model import llama_1_7_model, smaller_llama
 from single_gpu import Trainer
 from utils import (
     get_dataset,
-    CustomDataset,
-    PoorMansDataLoader,
     num_trainable_params,
     WarmupCosineWithDecay,
-    get_ddp_dataloader,
+    prepare_dataset
 )
 
 console = Console()
@@ -23,7 +22,7 @@ DATASET_NAME = "togethercomputer/RedPajama-Data-1T-Sample"
 VAL_SIZE = 0.001
 SEQ_LENGTH = 512
 BATCH_SIZE = 8
-PADDING = "max_length"
+PADDING = True
 DATASET_TEXT_FIELD = "text"
 LR = 3e-4
 WEIGHT_DECAY = 0.1
@@ -43,11 +42,11 @@ WANDB_RUN = None
 ANNEAL_STRATEGY = "cos"
 WARMUP_STEPS = 0.1
 MIN_LR_FACTOR = 10
-DDP = True
+DATASET_NUM_PROC = None
 
 
 def ddp_setup(rank, world_size):
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "134.65.167.66"
     os.environ["MASTER_PORT"] = "12355"
 
     # initialize the process group
@@ -65,6 +64,7 @@ def parse_args():
     parser.add_argument("--padding", type=str, default=PADDING)
     parser.add_argument("--dataset_text_field", type=str, default=DATASET_TEXT_FIELD)
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--dataset_num_proc", type=int, default=DATASET_NUM_PROC)
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--warmup", type=float, default=WARMUP_STEPS)
     parser.add_argument("--min_lr_factor", type=float, default=MIN_LR_FACTOR)
@@ -85,6 +85,7 @@ def parse_args():
     parser.add_argument("--torch_dtype", type=str, default=TORCH_DTYPE)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--gpu_id", type=int, default=GPU_ID)
+    parser.add_argument("--ddp", action=argparse.BooleanOptionalAction)
 
     args = parser.parse_args()
     return args
@@ -97,20 +98,23 @@ def load_train_objs(
     packing: bool,
     truncation: bool,
     padding: str,
+    batch_size: int,
     lr: float,
     weight_decay: float,
     smaller_model: bool = False,
+    dataset_num_proc: int = None,
 ):
-    console.log("Loading dataset...")
+    # console.log("Loading dataset...")
     hf_dataset = get_dataset(dataset, split="train")
     # Shuffle the dataset
     hf_dataset = hf_dataset.shuffle()
-    console.log("Splitting dataset...")
+    # hf_dataset = hf_dataset.select(range(100_000))
+    # console.log("Splitting dataset...")
     hf_dataset = hf_dataset.train_test_split(test_size=VAL_SIZE)
     train_dataset = hf_dataset["train"]
     val_dataset = hf_dataset["test"]
 
-    console.log("Loading model and tokenizer...")
+    # console.log("Loading model and tokenizer...")
     # Add special tokens here
     # - PAD token is a special token that is used for padding
     special_tokens = {"pad_token": "[PAD]"}
@@ -121,17 +125,18 @@ def load_train_objs(
     model = packed_obj["model"]
     tokenizer = packed_obj["tokenizer"]
 
-    console.log("Making custom dataset...")
-    train_dataset = CustomDataset(
+    train_dataset = prepare_dataset(
         hf_dataset=train_dataset,
         tokenizer=tokenizer,
         seq_length=seq_length,
         dataset_text_field=dataset_text_field,
         packing=packing,
         padding=padding,
-        trunctation=truncation,
+        truncation=truncation,
+        batch_size=batch_size,
+        dataset_num_proc=dataset_num_proc,
     )
-    val_dataset = CustomDataset(
+    val_dataset = prepare_dataset(
         hf_dataset=val_dataset,
         tokenizer=tokenizer,
         seq_length=seq_length,
@@ -139,18 +144,15 @@ def load_train_objs(
         packing=packing,
         padding=padding,
         truncation=truncation,
+        dataset_num_proc=dataset_num_proc
     )
 
-    console.log("Setting up optimizer...")
+    # console.log("Setting up optimizer...")
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     return train_dataset, val_dataset, model, tokenizer, optimizer
 
 
-def prepare_dataloader(dataset: CustomDataset, batch_size: int):
-    return PoorMansDataLoader(dataset, batch_size=batch_size)
-
-
-def main(args, rank: int, world_size: int):
+def main(rank: int, world_size: int, args):
     ddp_setup(rank, world_size)
 
     # Setting the device
@@ -199,34 +201,25 @@ def main(args, rank: int, world_size: int):
         lr=args.lr,
         weight_decay=args.weight_decay,
         smaller_model=args.small_model,
+        batch_size=args.batch_size,
+        dataset_num_proc=args.dataset_num_proc,
     )
 
-    if DDP:
-        # TODO:
-        # This is a temporary fix
-        # This should be handled by the data and training utils
-        hf_dataset = get_dataset(args.dataset_name, split="train")
-        hf_dataset = hf_dataset.shuffle()
-        hf_dataset = hf_dataset.train_test_split(test_size=VAL_SIZE)
-        train_dataloader = get_ddp_dataloader(
-            hf_dataset["train"],
-            tokenizer,
-            seq_length=args.seq_len,
-            dataset_text_field=args.dataset_text_field,
-            batch_size=args.batch_size,
-        )
-        val_dataloader = get_ddp_dataloader(
-            hf_dataset["test"],
-            tokenizer,
-            seq_length=args.seq_len,
-            dataset_text_field=args.dataset_text_field,
-            batch_size=args.batch_size,
-        )
-    else:
-        # DataLoaders process the datasets
-        # and provide an iterator
-        train_dataloader = prepare_dataloader(train_dataset, batch_size=args.batch_size)
-        val_dataloader = prepare_dataloader(val_dataset, batch_size=args.batch_size)
+    sampler = None
+    if args.ddp:
+        sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
+    # DataLoaders process the datasets
+    # and provide an iterator
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        sampler=sampler,
+    )
+    val_dataloader = DataLoader(
+        val_dataset, 
+        batch_size=args.batch_size,
+        sampler=sampler,
+    )
 
     # Number of steps is used for the learning rate scheduler
     num_steps = len(train_dataloader) * args.num_epochs // args.grad_accumulation_steps
@@ -252,8 +245,7 @@ def main(args, rank: int, world_size: int):
         val_dataloader=val_dataloader,
         optimizer=optimizer,
         lr_schedular=lr_scheduler,
-        # gpu_id=args.gpu_id,
-        gpu_id=args.rank,
+        gpu_id=rank,
         device=device,
         eval_every=args.eval_every,
         save_every=args.save_every,
@@ -270,6 +262,8 @@ def main(args, rank: int, world_size: int):
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run,
     )
+
+    destroy_process_group()
 
 
 def log_arguments(args, model, optimizer, lr_scheduler, device, torch_dtype, num_steps):
@@ -337,12 +331,14 @@ def log_arguments(args, model, optimizer, lr_scheduler, device, torch_dtype, num
 if __name__ == "__main__":
     args = parse_args()
     world_size = torch.cuda.device_count()
-    mp.spawn(
-        main,
-        args=(
-            args,
-            world_size,
-        ),
-        nprocs=world_size,
-    )
-    main(args)
+    if args.ddp:
+        mp.spawn(
+            main,
+            args=(
+                world_size,
+                args,
+            ),
+            nprocs=world_size,
+        )
+    else:
+        main(args, rank=0, world_size=1)
