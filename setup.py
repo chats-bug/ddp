@@ -19,7 +19,7 @@ from utils import (
 console = Console()
 
 DATASET_NAME = "togethercomputer/RedPajama-Data-1T-Sample"
-VAL_SIZE = 0.001
+VAL_SIZE = 0.01
 SEQ_LENGTH = 512
 BATCH_SIZE = 8
 PADDING = True
@@ -46,8 +46,8 @@ DATASET_NUM_PROC = None
 
 
 def ddp_setup(rank, world_size):
-    os.environ["MASTER_ADDR"] = "134.65.167.66"
-    os.environ["MASTER_PORT"] = "12355"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "1234"
 
     # initialize the process group
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
@@ -104,17 +104,11 @@ def load_train_objs(
     smaller_model: bool = False,
     dataset_num_proc: int = None,
 ):
-    # console.log("Loading dataset...")
     hf_dataset = get_dataset(dataset, split="train")
-    # Shuffle the dataset
-    hf_dataset = hf_dataset.shuffle()
-    # hf_dataset = hf_dataset.select(range(100_000))
-    # console.log("Splitting dataset...")
     hf_dataset = hf_dataset.train_test_split(test_size=VAL_SIZE)
     train_dataset = hf_dataset["train"]
     val_dataset = hf_dataset["test"]
 
-    # console.log("Loading model and tokenizer...")
     # Add special tokens here
     # - PAD token is a special token that is used for padding
     special_tokens = {"pad_token": "[PAD]"}
@@ -147,7 +141,6 @@ def load_train_objs(
         dataset_num_proc=dataset_num_proc
     )
 
-    # console.log("Setting up optimizer...")
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     return train_dataset, val_dataset, model, tokenizer, optimizer
 
@@ -206,7 +199,7 @@ def main(rank: int, world_size: int, args):
     )
 
     sampler = None
-    if args.ddp:
+    if args.ddp and not args.packing:
         sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
     # DataLoaders process the datasets
     # and provide an iterator
@@ -222,7 +215,7 @@ def main(rank: int, world_size: int, args):
     )
 
     # Number of steps is used for the learning rate scheduler
-    num_steps = len(train_dataloader) * args.num_epochs // args.grad_accumulation_steps
+    num_steps = len(train_dataloader) * args.num_epochs // (args.grad_accumulation_steps * world_size)
     if args.anneal == "cos":
         lr_scheduler = WarmupCosineWithDecay(
             optimizer,
@@ -237,7 +230,8 @@ def main(rank: int, world_size: int, args):
         console.log("Not using a learning rate scheduler")
         lr_scheduler = None
 
-    log_arguments(args, model, optimizer, lr_scheduler, device, torch_dtype, num_steps)
+    if rank == 0:
+        log_arguments(args, model, optimizer, lr_scheduler, device, torch_dtype, num_steps)
 
     trainer = Trainer(
         model=model,
@@ -255,6 +249,7 @@ def main(rank: int, world_size: int, args):
         torch_dtype=torch_dtype,
         max_grad_norm=args.max_grad_norm,
         report_to=args.report_to,
+        world_size=world_size,
     )
 
     trainer.train(
