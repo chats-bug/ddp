@@ -47,4 +47,7 @@ def get_llama_model(
         console.log(f"Model Size: {num_trainable_params(model)}", style="bold red")
     else:
         model = AutoModelForCausalLM.from_config(config)
+
+    if special_tokens:
+        model.resize_token_embeddings(len(tokenizer))
     return {"model": model, "tokenizer": tokenizer}
