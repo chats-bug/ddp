@@ -32,6 +32,7 @@ def prepare_dataset(
     **kwargs,
 ) -> Union[HFDataset, ConstantLengthDataset]:
     if packing:
+        kwargs.pop("dataset_num_proc")
         return ConstantLengthDataset(
             dataset=hf_dataset,
             tokenizer=tokenizer,
