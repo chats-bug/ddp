@@ -2,6 +2,7 @@ import os
 from typing import Union, Optional, Any
 
 import torch
+from torch.utils.data import DataLoader
 import wandb
 from rich.console import Console
 from rich.progress import (
@@ -14,10 +15,9 @@ from rich.progress import (
 )
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from utils import PoorMansDataLoader, format_float_to_str
+from utils import format_float_to_str
 
 console = Console()
-DDP = True
 
 
 class Trainer:
@@ -26,8 +26,8 @@ class Trainer:
     def __init__(
         self,
         model: torch.nn.Module,
-        train_dataloader: PoorMansDataLoader,
-        val_dataloader: PoorMansDataLoader,
+        train_dataloader: DataLoader,
+        val_dataloader: DataLoader,
         optimizer: torch.optim.Optimizer,
         gpu_id: int,
         device: Union[str, torch.device],
@@ -41,6 +41,7 @@ class Trainer:
         torch_dtype: torch.dtype = torch.float32,
         output_dir: Optional[str] = None,
         report_to: Optional[str] = None,
+        ddp: bool = False,
     ):
         assert (
             save_every % eval_every == 0
@@ -69,9 +70,10 @@ class Trainer:
             # If the device is not cuda, then the gpu_id is the device
             # This because the device is either "cpu" or probably a "mps" device
             self.gpu_id = self.device  # type: ignore
+        self.ddp = ddp
 
         # Set the
-        torch.set_default_device(self.device)
+        # torch.set_default_device(self.device)
 
         self.scaler = None
         if self.torch_dtype != torch.float32:
@@ -96,19 +98,19 @@ class Trainer:
 
         # Wrap the model with DDP if the device is cuda
         self.model.to(self.gpu_id)
-        self.model = DDP(self.model, device_ids=[self.gpu_id])
+        if self.ddp:
+            self.model = DDP(self.model, device_ids=[self.gpu_id])
 
         if not self.output_dir:
             self.output_dir = "output"
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
 
-        self.report_to = report_to
 
-    def _run_batch(self, source, target, step=1):
+    def _run_batch(self, source, target, step=1, attention_mask: Optional[torch.Tensor] = None):
         if self.scaler:
             with torch.autocast(device_type=self.device, dtype=self.torch_dtype):
-                output = self.model(source, labels=target)
+                output = self.model(source, labels=target, attention_mask=attention_mask)
                 loss = output.loss
                 # Normalize the loss for the grad_accumulation_steps
                 loss = loss / self.grad_accumulation_steps
@@ -154,8 +156,8 @@ class Trainer:
         return loss
 
     def _run_epoch(self, epoch: int):
-        train_bsz = self.train_dataloader.get_batch_size()
-        val_bsz = self.val_dataloader.get_batch_size()
+        train_bsz = self.train_dataloader.batch_size
+        val_bsz = self.val_dataloader.batch_size
         total_steps = len(self.train_dataloader) // self.grad_accumulation_steps
         step = 1
 
@@ -182,18 +184,19 @@ class Trainer:
 
             loss = 0
             for data in self.train_dataloader:
-                source = data["source"]
-                target = data["target"]
-                if DDP:
-                    source = data["input_ids"]
-                    target = data["input_ids"]
-                opt_step = step // self.grad_accumulation_steps + 1
-                self.model.train()
+                source = torch.stack(data["input_ids"])
+                target = torch.stack(data["input_ids"])
+                attention_mask = torch.stack(data["attention_mask"])
                 source = source.to(self.gpu_id)
                 target = target.to(self.gpu_id)
+                attention_mask = attention_mask.to(self.gpu_id)
+                
+                opt_step = step // self.grad_accumulation_steps
+                self.model.train()
                 loss += (
-                    self._run_batch(source, target, step) / self.grad_accumulation_steps
+                    self._run_batch(source, target, step, attention_mask) / self.grad_accumulation_steps
                 )
+                
                 if step % (self.log_every * self.grad_accumulation_steps) == 0:
                     # Write to wandb
                     if self.report_to == "wandb":
@@ -271,7 +274,7 @@ class Trainer:
                 step += 1
 
     def _save_checkpoint(self, epoch: int, step: int, log_fn):
-        ckp = self.model.module.state_dict()
+        ckp = self.model.module.state_dict() if self.ddp else self.model.state_dict()
         ckp_path = f"{self.output_dir}/ckp_epoch_{epoch}_step_{step}.pt"
         try:
             torch.save(ckp, ckp_path)
