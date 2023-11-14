@@ -2,6 +2,7 @@ import os
 from typing import Union, Optional, Any
 
 import torch
+from datasets import Dataset
 from torch.utils.data import DataLoader
 import wandb
 from rich.console import Console
@@ -41,6 +42,7 @@ class Trainer:
         torch_dtype: torch.dtype = torch.float32,
         output_dir: Optional[str] = None,
         report_to: Optional[str] = None,
+        world_size: int = 1,
         ddp: bool = False,
     ):
         assert (
@@ -66,6 +68,7 @@ class Trainer:
         self.max_grad_norm = max_grad_norm
         self.output_dir = output_dir
         self.report_to = report_to
+        self.world_size = world_size
         if self.device != "cuda":
             # If the device is not cuda, then the gpu_id is the device
             # This because the device is either "cpu" or probably a "mps" device
@@ -158,7 +161,10 @@ class Trainer:
     def _run_epoch(self, epoch: int):
         train_bsz = self.train_dataloader.batch_size
         val_bsz = self.val_dataloader.batch_size
-        total_steps = len(self.train_dataloader) // self.grad_accumulation_steps
+        if isinstance(self.train_dataloader.dataset, Dataset):
+            total_steps = len(self.train_dataloader) // (self.grad_accumulation_steps)
+        else:
+            total_steps = len(self.train_dataloader) // (self.grad_accumulation_steps * self.world_size)
         step = 1
 
         # Change the progress bar to add the following things:
@@ -179,17 +185,22 @@ class Trainer:
         ) as progress:
             training_task = progress.add_task(
                 "Training...",
-                total=len(self.train_dataloader) // self.grad_accumulation_steps,
+                total=total_steps,
             )
 
             loss = 0
             for data in self.train_dataloader:
-                source = torch.stack(data["input_ids"])
-                target = torch.stack(data["input_ids"])
-                attention_mask = torch.stack(data["attention_mask"])
+                if isinstance(data["input_ids"], list):
+                    data["input_ids"] = torch.stack(data["input_ids"])
+                    if "attention_mask" in data:
+                        data["attention_mask"] = torch.stack(data["attention_mask"])
+                source = data["input_ids"]
+                target = data["input_ids"]
+                attention_mask = data.get("attention_mask", None)
                 source = source.to(self.gpu_id)
                 target = target.to(self.gpu_id)
-                attention_mask = attention_mask.to(self.gpu_id)
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(self.gpu_id)
                 
                 opt_step = step // self.grad_accumulation_steps
                 self.model.train()
@@ -329,8 +340,55 @@ class Trainer:
                 wandb.init(config=wandb_config)
 
         for epoch in range(max_epochs):
-            self._run_epoch(epoch)
+            if self.ddp and self.gpu_id != 0:
+                self._run_epoch_no_log(epoch)
+            else:
+                self._run_epoch(epoch)
 
         # Finish wandb
         if self.report_to == "wandb":
             wandb.finish()
+
+    
+    def _run_epoch_no_log(self, epoch: int):
+        train_bsz = self.train_dataloader.batch_size
+        val_bsz = self.val_dataloader.batch_size
+        total_steps = len(self.train_dataloader) // self.grad_accumulation_steps
+        step = 1
+
+        # Change the progress bar to add the following things:
+        # 1. Add the current step
+        # 2. Add the total number of steps
+        loss = 0
+        for data in self.train_dataloader:
+            if isinstance(data["input_ids"], list):
+                data["input_ids"] = torch.stack(data["input_ids"])
+                if "attention_mask" in data:
+                    data["attention_mask"] = torch.stack(data["attention_mask"])
+            source = data["input_ids"]
+            target = data["input_ids"]
+            attention_mask = data.get("attention_mask", None)
+            source = source.to(self.gpu_id)
+            target = target.to(self.gpu_id)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.gpu_id)
+            
+            opt_step = step // self.grad_accumulation_steps
+            self.model.train()
+            loss += (
+                self._run_batch(source, target, step, attention_mask) / self.grad_accumulation_steps
+            )
+
+            if step % self.grad_accumulation_steps == 0:
+                loss = 0
+
+            if step % (self.eval_every * self.grad_accumulation_steps) == 0:
+                self.model.eval()
+                val_loss = 0
+                for ev_source, ev_target in self.val_dataloader:
+                    ev_source = ev_source.to(self.gpu_id)
+                    ev_target = ev_target.to(self.gpu_id)
+                    val_loss += self._run_eval(ev_source, ev_target)
+                val_loss /= len(self.val_dataloader)  # type: ignore
+
+            step += 1
