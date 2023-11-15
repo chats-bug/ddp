@@ -2,9 +2,8 @@ import os
 from typing import Union, Optional, Any
 
 import torch
-from datasets import Dataset
-from torch.utils.data import DataLoader
 import wandb
+from datasets import Dataset
 from rich.console import Console
 from rich.progress import (
     Progress,
@@ -15,6 +14,7 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
 
 from utils import format_float_to_str
 
@@ -109,11 +109,14 @@ class Trainer:
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
 
-
-    def _run_batch(self, source, target, step=1, attention_mask: Optional[torch.Tensor] = None):
+    def _run_batch(
+        self, source, target, step=1, attention_mask: Optional[torch.Tensor] = None
+    ):
         if self.scaler:
             with torch.autocast(device_type=self.device, dtype=self.torch_dtype):
-                output = self.model(source, labels=target, attention_mask=attention_mask)
+                output = self.model(
+                    source, labels=target, attention_mask=attention_mask
+                )
                 loss = output.loss
                 # Normalize the loss for the grad_accumulation_steps
                 loss = loss / self.grad_accumulation_steps
@@ -164,7 +167,9 @@ class Trainer:
         if isinstance(self.train_dataloader.dataset, Dataset):
             total_steps = len(self.train_dataloader) // (self.grad_accumulation_steps)
         else:
-            total_steps = len(self.train_dataloader) // (self.grad_accumulation_steps * self.world_size)
+            total_steps = len(self.train_dataloader) // (
+                self.grad_accumulation_steps * self.world_size
+            )
         step = 1
 
         # Change the progress bar to add the following things:
@@ -190,24 +195,15 @@ class Trainer:
 
             loss = 0
             for data in self.train_dataloader:
-                if isinstance(data["input_ids"], list):
-                    data["input_ids"] = torch.stack(data["input_ids"])
-                    if "attention_mask" in data:
-                        data["attention_mask"] = torch.stack(data["attention_mask"])
-                source = data["input_ids"]
-                target = data["input_ids"]
-                attention_mask = data.get("attention_mask", None)
-                source = source.to(self.gpu_id)
-                target = target.to(self.gpu_id)
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(self.gpu_id)
-                
+                data.to(self.gpu_id)
+
                 opt_step = step // self.grad_accumulation_steps
                 self.model.train()
                 loss += (
-                    self._run_batch(source, target, step, attention_mask) / self.grad_accumulation_steps
+                    self._run_batch(source=data, target=data, step=step)
+                    / self.grad_accumulation_steps
                 )
-                
+
                 if step % (self.log_every * self.grad_accumulation_steps) == 0:
                     # Write to wandb
                     if self.report_to == "wandb":
@@ -349,7 +345,6 @@ class Trainer:
         if self.report_to == "wandb":
             wandb.finish()
 
-    
     def _run_epoch_no_log(self, epoch: int):
         train_bsz = self.train_dataloader.batch_size
         val_bsz = self.val_dataloader.batch_size
@@ -361,22 +356,13 @@ class Trainer:
         # 2. Add the total number of steps
         loss = 0
         for data in self.train_dataloader:
-            if isinstance(data["input_ids"], list):
-                data["input_ids"] = torch.stack(data["input_ids"])
-                if "attention_mask" in data:
-                    data["attention_mask"] = torch.stack(data["attention_mask"])
-            source = data["input_ids"]
-            target = data["input_ids"]
-            attention_mask = data.get("attention_mask", None)
-            source = source.to(self.gpu_id)
-            target = target.to(self.gpu_id)
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(self.gpu_id)
-            
+            data.to(self.gpu_id)
+
             opt_step = step // self.grad_accumulation_steps
             self.model.train()
             loss += (
-                self._run_batch(source, target, step, attention_mask) / self.grad_accumulation_steps
+                self._run_batch(source=data, target=data, step=step)
+                / self.grad_accumulation_steps
             )
 
             if step % self.grad_accumulation_steps == 0:
