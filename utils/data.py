@@ -1,9 +1,13 @@
-from typing import Optional, Union
-import multiprocess as mp
+from typing import Optional, Union, List
+
 import torch
-from datasets import load_dataset, Dataset as HFDataset
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from datasets import load_dataset, Dataset
+from torch.utils.data import DataLoader, DistributedSampler
 from trl.trainer.utils import ConstantLengthDataset
+from transformers import PreTrainedTokenizerBase
+import multiprocessing as mp
+from concat_dataset import ConcatTokensDataset
+from tqdm import tqdm
 
 
 def get_dataset(
@@ -11,95 +15,157 @@ def get_dataset(
     subset: Optional[str] = None,
     split: Optional[str] = None,
     **kwargs,
-) -> HFDataset:
+) -> Dataset:
     data_path = dataset_name
     if subset:
         data_path += f"/{subset}"
     return load_dataset(data_path, split=split, **kwargs)
 
 
-def prepare_dataset(
-    hf_dataset: HFDataset,
-    tokenizer,
-    dataset_text_field: Optional[str] = None,
-    seq_length: int = 1024,
-    packing: bool = True,
-    truncation: bool = False,
-    padding: Optional[str] = None,
-    formatting_func=None,
-    batch_size: int = 8,
-    *args,
-    **kwargs,
-) -> Union[HFDataset, ConstantLengthDataset]:
-    if packing:
-        kwargs.pop("dataset_num_proc")
-        return ConstantLengthDataset(
-            dataset=hf_dataset,
-            tokenizer=tokenizer,
-            seq_length=seq_length,
-            dataset_text_field=dataset_text_field,
-            *args,
-            **kwargs,
-        )
-    else:
-        use_formatting_func = formatting_func is not None and dataset_text_field is not None
-        def tokenize(element):
-            outputs = tokenizer(
-                element[dataset_text_field] if not use_formatting_func else formatting_func(element),
-                truncation=truncation,
-                padding=padding,
-                max_length=seq_length,
-                return_overflowing_tokens=False,
-                return_length=False,
-                return_tensors="pt",
-            )
-
-            if use_formatting_func:
-                if not isinstance(formatting_func(element), list):
-                    raise ValueError(
-                        "The `formatting_func` should return a list of processed strings since it can lead to silent bugs."
-                    )
-
-            return {"input_ids": outputs["input_ids"], "attention_mask": outputs["attention_mask"]}
-        
-        max_workers = None
-        if "dataset_num_proc" in kwargs:
-            max_workers = kwargs.pop("dataset_num_proc")
-        print(f"Using {max_workers} workers to tokenize the dataset")
-        return hf_dataset.map(
-            tokenize,
-            batched=True,
-            remove_columns=hf_dataset.column_names,
-            num_proc=max_workers,
-            batch_size=batch_size,
-            *args,
-            **kwargs,
-        )
-
-
-if __name__ == "__main__":
-    dataset_name = "roneneldan/TinyStories"
-    dataset = get_dataset(dataset_name, split="train")
-    dataset = dataset.select(range(100_000))
-
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
-    tokenizer.pad_token = tokenizer.eos_token
-
-    dataset = prepare_dataset(
-        dataset, 
-        tokenizer, 
-        dataset_text_field="text", 
-        seq_length=1024, 
-        packing=False, 
-        truncation=True, 
-        padding="max_length", 
-        batch_size=8, 
-        dataset_num_proc=16
+# This function will be run in parallel processes to process dataset partitions
+def process_partition(args):
+    (
+        hf_dataset_partition,
+        dataset_text_field,
+        tokenizer,
+        max_length,
+        bos_text,
+        eos_text,
+        no_wrap,
+        num_proc,
+        is_tokenized,
+    ) = args
+    return process_dataset(
+        hf_dataset_partition,
+        dataset_text_field,
+        tokenizer,
+        max_length,
+        bos_text,
+        eos_text,
+        no_wrap,
+        num_proc,
+        is_tokenized,
     )
 
-    for batch in dataset:
-        print(batch)
-        print(batch['input_ids'].shape)
-        break
 
+def process_dataset(
+    hf_dataset: Dataset,
+    dataset_text_field: str,
+    tokenizer: PreTrainedTokenizerBase,
+    max_length: int,
+    bos_text: str,
+    eos_text: str,
+    no_wrap: bool,
+    num_proc: int | None = None,
+    is_tokenized: bool = True,
+):
+    concat_tokens_dataset = ConcatTokensDataset(
+        hf_dataset=hf_dataset,
+        dataset_text_field=dataset_text_field,
+        tokenizer=tokenizer,
+        max_length=max_length,
+        bos_text=bos_text,
+        eos_text=eos_text,
+        no_wrap=no_wrap,
+        num_proc=num_proc,
+        is_tokenized=is_tokenized,
+        pre_tokenize=True,
+    )
+
+    packed_dataset_dict = {"tokens": []}
+    for sample in concat_tokens_dataset:
+        packed_dataset_dict["tokens"].append(sample["tokens"])
+    packed_dataset = Dataset.from_dict(packed_dataset_dict)
+    return packed_dataset
+
+
+def prepare_dataset(
+    hf_dataset: Dataset,
+    dataset_text_field: str,
+    tokenizer: PreTrainedTokenizerBase,
+    max_length: int,
+    bos_text: str,
+    eos_text: str,
+    no_wrap: bool,
+    num_proc: int | None = None,
+    num_partitions: int | None = 4,
+) -> torch.Tensor:
+    num_proc = mp.cpu_count() - 1 if num_proc is None else num_proc
+    num_partitions = num_proc if num_partitions is None else num_partitions
+
+    hf_dataset = hf_dataset.map(
+        lambda x: tokenizer(
+            x[dataset_text_field],
+            padding=False,
+            truncation=False,
+            return_tensors="pt",
+        ),
+        num_proc=num_proc,
+        batched=True,
+        batch_size=1,
+    )
+
+    sz = len(hf_dataset) // num_partitions
+    print(
+        f"Done tokenizing the dataset. Splitting into {num_partitions} partitions of size {sz}. \
+            Total size: {len(hf_dataset)}::{sz*num_partitions}"
+    )
+    # Split the tokenized dataset into num_partitions
+    partitions = [
+        hf_dataset.shard(num_partitions, i, contiguous=True)
+        for i in range(num_partitions)
+    ]
+
+    # Prepare arguments for parallel execution
+    args_list = [
+        (
+            partitions[i],
+            "text",
+            tokenizer,
+            max_length,
+            bos_text,
+            eos_text,
+            no_wrap,
+            num_proc,
+            True,
+        )
+        for i in range(num_partitions)
+    ]
+    """
+    hf_dataset_partition,
+    tokenizer,
+    max_length,
+    bos_text,
+    eos_text,
+    no_wrap,
+    num_proc,
+    is_tokenized,
+    """
+
+    print("Creating a pool of worker processes")
+    # Create a pool of worker processes
+    pool = mp.Pool(processes=num_partitions)
+
+    print("Processing dataset partitions in parallel")
+    # Process dataset partitions in parallel
+    results = pool.map(process_partition, args_list)
+
+    # Terminate the pool of workers
+    pool.close()
+    pool.join()
+
+    print("Merging the results")
+    # Merge the results into a single dataset
+    merged_dataset_dict = {"tokens": torch.tensor([])}
+    for result in tqdm(results):
+        if len(merged_dataset_dict["tokens"]) == 0:
+            merged_dataset_dict["tokens"] = torch.Tensor(result["tokens"])
+            continue
+
+        merged_dataset_dict["tokens"] = torch.cat(
+            (merged_dataset_dict["tokens"], torch.Tensor(result["tokens"])), dim=0
+        )
+
+    # Convert the merged dictionary to a Dataset
+    # merged_dataset = Dataset.from_dict(merged_dataset_dict)
+    return merged_dataset_dict["tokens"]
