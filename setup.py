@@ -1,11 +1,12 @@
+import os
+
 import torch
-import torch.optim
 import torch.multiprocessing as mp
-from torch.distributed import init_process_group, destroy_process_group
-from torch.utils.data import DataLoader, DistributedSampler
+import torch.optim
 from rich.console import Console
 from rich.table import Table
-import os
+from torch.distributed import init_process_group, destroy_process_group
+from torch.utils.data import DataLoader, DistributedSampler
 
 from model import llama_1_7_model, smaller_llama
 from single_gpu import Trainer
@@ -13,7 +14,7 @@ from utils import (
     get_dataset,
     num_trainable_params,
     WarmupCosineWithDecay,
-    prepare_dataset
+    prepare_dataset,
 )
 
 console = Console()
@@ -22,7 +23,6 @@ DATASET_NAME = "togethercomputer/RedPajama-Data-1T-Sample"
 VAL_SIZE = 0.01
 SEQ_LENGTH = 512
 BATCH_SIZE = 8
-PADDING = True
 DATASET_TEXT_FIELD = "text"
 LR = 3e-4
 WEIGHT_DECAY = 0.1
@@ -59,9 +59,6 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--small_model", action=argparse.BooleanOptionalAction)
     parser.add_argument("--seq_len", type=int, default=SEQ_LENGTH)
-    parser.add_argument("--packing", action=argparse.BooleanOptionalAction)
-    parser.add_argument("--truncation", action=argparse.BooleanOptionalAction)
-    parser.add_argument("--padding", type=str, default=PADDING)
     parser.add_argument("--dataset_text_field", type=str, default=DATASET_TEXT_FIELD)
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     parser.add_argument("--dataset_num_proc", type=int, default=DATASET_NUM_PROC)
@@ -95,10 +92,6 @@ def load_train_objs(
     dataset: str,
     dataset_text_field: str,
     seq_length: int,
-    packing: bool,
-    truncation: bool,
-    padding: str,
-    batch_size: int,
     lr: float,
     weight_decay: float,
     smaller_model: bool = False,
@@ -122,23 +115,22 @@ def load_train_objs(
     train_dataset = prepare_dataset(
         hf_dataset=train_dataset,
         tokenizer=tokenizer,
-        seq_length=seq_length,
+        max_length=seq_length,
         dataset_text_field=dataset_text_field,
-        packing=packing,
-        padding=padding,
-        truncation=truncation,
-        batch_size=batch_size,
-        dataset_num_proc=dataset_num_proc,
+        bos_text=tokenizer.bos_token,
+        eos_text=tokenizer.eos_token,
+        num_proc=dataset_num_proc,
+        num_partitions=dataset_num_proc,
     )
     val_dataset = prepare_dataset(
-        hf_dataset=val_dataset,
+        hf_dataset=train_dataset,
         tokenizer=tokenizer,
-        seq_length=seq_length,
+        max_length=seq_length,
         dataset_text_field=dataset_text_field,
-        packing=packing,
-        padding=padding,
-        truncation=truncation,
-        dataset_num_proc=dataset_num_proc
+        bos_text=tokenizer.bos_token,
+        eos_text=tokenizer.eos_token,
+        num_proc=dataset_num_proc,
+        num_partitions=dataset_num_proc,
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -188,18 +180,14 @@ def main(rank: int, world_size: int, args):
         dataset=args.dataset_name,
         seq_length=args.seq_len,
         dataset_text_field=args.dataset_text_field,
-        packing=args.packing,
-        truncation=args.truncation,
-        padding=args.padding,
         lr=args.lr,
         weight_decay=args.weight_decay,
         smaller_model=args.small_model,
-        batch_size=args.batch_size,
         dataset_num_proc=args.dataset_num_proc,
     )
 
     sampler = None
-    if args.ddp and not args.packing:
+    if args.ddp:
         sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
     # DataLoaders process the datasets
     # and provide an iterator
@@ -209,13 +197,17 @@ def main(rank: int, world_size: int, args):
         sampler=sampler,
     )
     val_dataloader = DataLoader(
-        val_dataset, 
+        val_dataset,
         batch_size=args.batch_size,
         sampler=sampler,
     )
 
     # Number of steps is used for the learning rate scheduler
-    num_steps = len(train_dataloader) * args.num_epochs // (args.grad_accumulation_steps * world_size)
+    num_steps = (
+        len(train_dataloader)
+        * args.num_epochs
+        // (args.grad_accumulation_steps * world_size)
+    )
     if args.anneal == "cos":
         lr_scheduler = WarmupCosineWithDecay(
             optimizer,
@@ -231,7 +223,9 @@ def main(rank: int, world_size: int, args):
         lr_scheduler = None
 
     if rank == 0:
-        log_arguments(args, model, optimizer, lr_scheduler, device, torch_dtype, num_steps)
+        log_arguments(
+            args, model, optimizer, lr_scheduler, device, torch_dtype, num_steps
+        )
 
     trainer = Trainer(
         model=model,
@@ -272,10 +266,7 @@ def log_arguments(args, model, optimizer, lr_scheduler, device, torch_dtype, num
     table.add_row("Model Size", f"{(num_trainable_params(model) / 1e9):.2f}B")
     table.add_row("Dataset", str(args.dataset_name))
     table.add_row("Dataset Text Field", str(args.dataset_text_field))
-    table.add_row("Packing", str(args.packing))
     table.add_row("Sequence Length", str(args.seq_len))
-    table.add_row("Truncation", str(args.truncation))
-    table.add_row("Padding", str(args.padding))
 
     table.add_row("", "")
     table.add_row("-------------------", "-------------------")
