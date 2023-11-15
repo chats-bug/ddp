@@ -123,7 +123,7 @@ def load_train_objs(
         num_partitions=dataset_num_proc,
     )
     val_dataset = prepare_dataset(
-        hf_dataset=train_dataset,
+        hf_dataset=val_dataset,
         tokenizer=tokenizer,
         max_length=seq_length,
         dataset_text_field=dataset_text_field,
@@ -327,4 +327,4 @@ if __name__ == "__main__":
             nprocs=world_size,
         )
     else:
-        main(args, rank=0, world_size=1)
+        main(rank=0, world_size=1, args=args)

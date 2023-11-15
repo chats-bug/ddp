@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from trl.trainer.utils import ConstantLengthDataset
 from transformers import PreTrainedTokenizerBase
 import multiprocessing as mp
-from concat_dataset import ConcatTokensDataset
+from .concat_dataset import ConcatTokensDataset
 from tqdm import tqdm
 
 
@@ -86,7 +86,7 @@ def prepare_dataset(
     max_length: int,
     bos_text: str,
     eos_text: str,
-    no_wrap: bool,
+    no_wrap: bool = False,
     num_proc: int | None = None,
     num_partitions: int | None = 4,
 ) -> torch.Tensor:
