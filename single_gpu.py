@@ -2,8 +2,9 @@ import os
 from typing import Union, Optional, Any
 
 import torch
-import wandb
 from datasets import Dataset
+from torch.utils.data import DataLoader
+import wandb
 from rich.console import Console
 from rich.progress import (
     Progress,
@@ -14,7 +15,6 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
 
 from utils import format_float_to_str
 
