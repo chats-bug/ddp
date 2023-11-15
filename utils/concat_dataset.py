@@ -117,7 +117,7 @@ class ConcatTokensDataset:
                 )
 
     def __iter__(self) -> Iterable[Dict[str, torch.Tensor]]:
-        buffer = torch.tensor([])
+        buffer = torch.tensor([], dtype=torch.long)
         dataset_to_iter = (
             self.encoded_dataset
             if hasattr(self, "encoded_dataset")
@@ -140,7 +140,7 @@ class ConcatTokensDataset:
                 encoded = sample
             iids = encoded["input_ids"]
             if not isinstance(iids, torch.Tensor):
-                iids = torch.tensor(iids)
+                iids = torch.tensor(iids, dtype=torch.long)
             buffer = torch.cat((buffer, self.bos_tokens, iids, self.eos_tokens), dim=0)
             while len(buffer) >= self.max_length:
                 concat_sample = buffer[: self.max_length]

@@ -72,11 +72,15 @@ def process_dataset(
         pre_tokenize=True,
     )
 
-    packed_dataset_dict = {"tokens": []}
+    packed_dataset_dict = {"tokens": torch.tensor([], dtype=torch.long)}
     for sample in concat_tokens_dataset:
-        packed_dataset_dict["tokens"].append(sample["tokens"])
-    packed_dataset = Dataset.from_dict(packed_dataset_dict)
-    return packed_dataset
+        if len(packed_dataset_dict["tokens"]) == 0:
+            packed_dataset_dict["tokens"] = sample["tokens"]
+            continue
+        packed_dataset_dict["tokens"] = torch.cat(
+            (packed_dataset_dict["tokens"], sample["tokens"]), dim=0
+        )
+    return packed_dataset_dict
 
 
 def prepare_dataset(
@@ -156,14 +160,14 @@ def prepare_dataset(
 
     print("Merging the results")
     # Merge the results into a single dataset
-    merged_dataset_dict = {"tokens": torch.tensor([])}
+    merged_dataset_dict = {"tokens": torch.tensor([], dtype=torch.long)}
     for result in tqdm(results):
         if len(merged_dataset_dict["tokens"]) == 0:
-            merged_dataset_dict["tokens"] = torch.Tensor(result["tokens"])
+            merged_dataset_dict["tokens"] = result["tokens"]
             continue
 
         merged_dataset_dict["tokens"] = torch.cat(
-            (merged_dataset_dict["tokens"], torch.Tensor(result["tokens"])), dim=0
+            (merged_dataset_dict["tokens"], result["tokens"]), dim=0
         )
 
     # Convert the merged dictionary to a Dataset
