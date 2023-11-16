@@ -49,8 +49,13 @@ def ddp_setup(rank, world_size):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "1234"
 
-    # initialize the process group
-    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    if torch.cuda.is_available():
+        # initialize the process group
+        init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    else:
+        console.log(
+            "No CUDA device found. Cannot run distributed training.", style="bold red"
+        )
 
 
 def parse_args():
