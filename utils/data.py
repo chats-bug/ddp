@@ -74,6 +74,7 @@ def process_dataset(
 
     packed_dataset_dict = {"tokens": torch.tensor([], dtype=torch.long)}
     for sample in concat_tokens_dataset:
+        sample["tokens"] = sample["tokens"].unsqueeze(0)
         if len(packed_dataset_dict["tokens"]) == 0:
             packed_dataset_dict["tokens"] = sample["tokens"]
             continue
@@ -169,7 +170,4 @@ def prepare_dataset(
         merged_dataset_dict["tokens"] = torch.cat(
             (merged_dataset_dict["tokens"], result["tokens"]), dim=0
         )
-
-    # Convert the merged dictionary to a Dataset
-    # merged_dataset = Dataset.from_dict(merged_dataset_dict)
     return merged_dataset_dict["tokens"]
