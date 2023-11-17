@@ -6,8 +6,12 @@ from torch.utils.data import DataLoader, DistributedSampler
 from trl.trainer.utils import ConstantLengthDataset
 from transformers import PreTrainedTokenizerBase
 import multiprocessing as mp
-from .concat_dataset import ConcatTokensDataset
+if __name__ == "__main__":
+    from concat_dataset import ConcatTokensDataset
+else:
+    from .concat_dataset import ConcatTokensDataset
 from tqdm import tqdm
+from multiprocessing.pool import ThreadPool as Pool
 
 
 def get_dataset(
@@ -149,7 +153,7 @@ def prepare_dataset(
 
     print("Creating a pool of worker processes")
     # Create a pool of worker processes
-    pool = mp.Pool(processes=num_partitions)
+    pool = Pool(processes=num_partitions)
 
     print("Processing dataset partitions in parallel")
     # Process dataset partitions in parallel
@@ -171,3 +175,58 @@ def prepare_dataset(
             (merged_dataset_dict["tokens"], result["tokens"]), dim=0
         )
     return merged_dataset_dict["tokens"]
+
+
+
+if __name__ == "__main__":
+    import argparse
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+    from tqdm import tqdm
+    from torch.utils.data import DataLoader
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset_name", type=str, default="roneneldan/TinyStories")
+    parser.add_argument("--subset", type=float, default=0.0)
+    parser.add_argument("--dataset_text_field", type=str, default="text")
+    parser.add_argument("--tokenizer_name", type=str, default="meta-llama/Llama-2-7b-hf")
+    parser.add_argument("--max_length", type=int, default=512)
+    parser.add_argument("--bsz", type=int, default=4)
+    parser.add_argument("--num_proc", type=int, default=4)
+    parser.add_argument("--num_partitions", type=int, default=4)
+
+    args = parser.parse_args()
+
+    print(f"Loading dataset: {args.dataset_name}, subset: {args.subset if args.subset > 0.0 else 'all'}")
+    dataset = load_dataset(args.dataset_name, split="train")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    if args.subset > 0.0:
+        if args.subset > 1.0:
+            dataset = dataset.select(range(int(args.subset)))
+        else:
+            dataset = dataset.select(range(int(len(dataset) * args.subset)))
+
+    prepared_dataset = prepare_dataset(
+        hf_dataset=dataset,
+        dataset_text_field=args.dataset_text_field,
+        tokenizer=tokenizer,
+        max_length=args.max_length,
+        bos_text=tokenizer.bos_token,
+        eos_text=tokenizer.eos_token,
+        num_proc=args.num_proc,
+        num_partitions=args.num_partitions,
+    )
+
+    
+    dataloader = DataLoader(
+        prepared_dataset,
+        batch_size=args.bsz,
+        shuffle=False,
+        pin_memory=True,
+    )
+
+    for batch in dataloader:
+        print(batch.shape)
+        break
