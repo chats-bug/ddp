@@ -1,5 +1,4 @@
 import os
-
 import torch
 import torch.multiprocessing as mp
 import torch.optim
@@ -7,6 +6,8 @@ from rich.console import Console
 from rich.table import Table
 from torch.distributed import init_process_group, destroy_process_group
 from torch.utils.data import DataLoader, DistributedSampler
+import warnings
+
 
 from model import llama_1_7_model, smaller_llama
 from single_gpu import Trainer
@@ -17,6 +18,8 @@ from utils import (
     prepare_dataset,
 )
 
+# Suppressing future warnings
+warnings.simplefilter(action="ignore", category=FutureWarning)
 console = Console()
 
 DATASET_NAME = "togethercomputer/RedPajama-Data-1T-Sample"
@@ -66,6 +69,7 @@ def parse_args():
     parser.add_argument("--seq_len", type=int, default=SEQ_LENGTH)
     parser.add_argument("--dataset_text_field", type=str, default=DATASET_TEXT_FIELD)
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--subset", type=float, default=0.0)
     parser.add_argument("--dataset_num_proc", type=int, default=DATASET_NUM_PROC)
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--warmup", type=float, default=WARMUP_STEPS)
@@ -101,8 +105,14 @@ def load_train_objs(
     weight_decay: float,
     smaller_model: bool = False,
     dataset_num_proc: int = None,
+    subset: float = 0.0,
 ):
     hf_dataset = get_dataset(dataset, split="train")
+    if subset > 0.0:
+        if subset > 1.0:
+            hf_dataset = hf_dataset.select(range(int(subset)))
+        else:
+            hf_dataset = hf_dataset.select(range(int(subset * len(hf_dataset))))
     hf_dataset = hf_dataset.train_test_split(test_size=VAL_SIZE)
     train_dataset = hf_dataset["train"]
     val_dataset = hf_dataset["test"]
@@ -189,6 +199,7 @@ def main(rank: int, world_size: int, args):
         weight_decay=args.weight_decay,
         smaller_model=args.small_model,
         dataset_num_proc=args.dataset_num_proc,
+        subset=args.subset,
     )
 
     sampler = None
@@ -207,12 +218,17 @@ def main(rank: int, world_size: int, args):
         sampler=sampler,
     )
 
+    print(f"Train dataloader length: {len(train_dataset)}(train_dataset) // {args.batch_size}(batch_size) * {world_size}(world_size) = {len(train_dataloader)}")
+    print(f"Val dataloader length: {len(val_dataset)}(val_dataset) // {args.batch_size}(batch_size) * {world_size}(world_size) = {len(val_dataloader)}")
+
     # Number of steps is used for the learning rate scheduler
     num_steps = (
         len(train_dataloader)
         * args.num_epochs
-        // (args.grad_accumulation_steps * world_size)
+        // args.grad_accumulation_steps
     )
+    print(f"Number of training steps: {len(train_dataloader)}(train_dataloader) * {args.num_epochs}(num_epochs) // {args.grad_accumulation_steps}(grad_accumulation_steps) = {num_steps}")
+
     if args.anneal == "cos":
         lr_scheduler = WarmupCosineWithDecay(
             optimizer,
@@ -249,6 +265,7 @@ def main(rank: int, world_size: int, args):
         max_grad_norm=args.max_grad_norm,
         report_to=args.report_to,
         world_size=world_size,
+        ddp=args.ddp,
     )
 
     trainer.train(
