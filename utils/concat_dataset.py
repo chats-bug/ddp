@@ -116,6 +116,9 @@ class ConcatTokensDataset:
                     return_tensors="pt",
                 )
 
+    def __len__(self) -> int:
+        return len(self.hf_dataset)
+
     def __iter__(self) -> Iterable[Dict[str, torch.Tensor]]:
         buffer = torch.tensor([], dtype=torch.long)
         dataset_to_iter = (
