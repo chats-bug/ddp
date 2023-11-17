@@ -164,12 +164,7 @@ class Trainer:
     def _run_epoch(self, epoch: int):
         train_bsz = self.train_dataloader.batch_size
         val_bsz = self.val_dataloader.batch_size
-        if isinstance(self.train_dataloader.dataset, Dataset):
-            total_steps = len(self.train_dataloader) // (self.grad_accumulation_steps)
-        else:
-            total_steps = len(self.train_dataloader) // (
-                self.grad_accumulation_steps * self.world_size
-            )
+        total_steps = len(self.train_dataloader) // self.grad_accumulation_steps
         step = 1
 
         # Change the progress bar to add the following things:
@@ -195,7 +190,7 @@ class Trainer:
 
             loss = 0
             for data in self.train_dataloader:
-                data.to(self.gpu_id)
+                data = data.to(self.gpu_id)
 
                 opt_step = step // self.grad_accumulation_steps
                 self.model.train()
