@@ -152,8 +152,54 @@ def load_train_objs(
     return train_dataset, val_dataset, model, tokenizer, optimizer
 
 
-def main(rank: int, world_size: int, args):
-    ddp_setup(rank, world_size)
+def main(args):
+    # Training Objects are loaded here
+    # Datasets(train and validation)
+    # model, tokenizer and optimizer
+    train_dataset, val_dataset, model, tokenizer, optimizer = load_train_objs(
+        dataset=args.dataset_name,
+        seq_length=args.seq_len,
+        dataset_text_field=args.dataset_text_field,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        smaller_model=args.small_model,
+        dataset_num_proc=args.dataset_num_proc,
+        subset=args.subset,
+    )
+
+    print("Loaded training objects")
+    print("Launching training...")
+    
+    world_size = torch.cuda.device_count()
+    if args.ddp:
+        mp.spawn(
+            train,
+            args=(
+                world_size,
+                train_dataset,
+                val_dataset,
+                model,
+                tokenizer,
+                optimizer,
+                args,
+            ),
+        )
+    else:
+        train(
+            rank=0,
+            world_size=1,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            model=model,
+            tokenizer=tokenizer,
+            optimizer=optimizer,
+            args=args,
+        )
+
+
+def train(rank: int, world_size: int, train_dataset, val_dataset, model, tokenizer, optimizer, args):
+    if args.ddp:
+        ddp_setup(rank, world_size)
 
     # Setting the device
     # Using GPUs significantly speeds up the training process
@@ -188,19 +234,6 @@ def main(rank: int, world_size: int, args):
         console.log("Setting torch_dtype to fp16")
         torch_dtype = torch.float16
 
-    # Training Objects are loaded here
-    # Datasets(train and validation)
-    # model, tokenizer and optimizer
-    train_dataset, val_dataset, model, tokenizer, optimizer = load_train_objs(
-        dataset=args.dataset_name,
-        seq_length=args.seq_len,
-        dataset_text_field=args.dataset_text_field,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        smaller_model=args.small_model,
-        dataset_num_proc=args.dataset_num_proc,
-        subset=args.subset,
-    )
 
     sampler = None
     if args.ddp:
@@ -247,6 +280,8 @@ def main(rank: int, world_size: int, args):
         log_arguments(
             args, model, optimizer, lr_scheduler, device, torch_dtype, num_steps
         )
+    else:
+        console.log(f"Starting training on GPU {rank} using {device}...", style="bold green")
 
     trainer = Trainer(
         model=model,
@@ -274,7 +309,8 @@ def main(rank: int, world_size: int, args):
         wandb_run_name=args.wandb_run,
     )
 
-    destroy_process_group()
+    if args.ddp:
+        destroy_process_group()
 
 
 def log_arguments(args, model, optimizer, lr_scheduler, device, torch_dtype, num_steps):
@@ -338,15 +374,4 @@ def log_arguments(args, model, optimizer, lr_scheduler, device, torch_dtype, num
 
 if __name__ == "__main__":
     args = parse_args()
-    world_size = torch.cuda.device_count()
-    if args.ddp:
-        mp.spawn(
-            main,
-            args=(
-                world_size,
-                args,
-            ),
-            nprocs=world_size,
-        )
-    else:
-        main(rank=0, world_size=1, args=args)
+    main(args)
