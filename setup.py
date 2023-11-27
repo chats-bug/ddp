@@ -169,7 +169,7 @@ def main(args):
 
     print("Loaded training objects")
     print("Launching training...")
-    
+
     world_size = torch.cuda.device_count()
     if args.ddp:
         mp.spawn(
@@ -183,6 +183,7 @@ def main(args):
                 optimizer,
                 args,
             ),
+            nprocs=world_size,
         )
     else:
         train(
@@ -197,7 +198,16 @@ def main(args):
         )
 
 
-def train(rank: int, world_size: int, train_dataset, val_dataset, model, tokenizer, optimizer, args):
+def train(
+    rank: int,
+    world_size: int,
+    train_dataset,
+    val_dataset,
+    model,
+    tokenizer,
+    optimizer,
+    args,
+):
     if args.ddp:
         ddp_setup(rank, world_size)
 
@@ -234,7 +244,6 @@ def train(rank: int, world_size: int, train_dataset, val_dataset, model, tokeniz
         console.log("Setting torch_dtype to fp16")
         torch_dtype = torch.float16
 
-
     sampler = None
     if args.ddp:
         sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
@@ -251,16 +260,18 @@ def train(rank: int, world_size: int, train_dataset, val_dataset, model, tokeniz
         sampler=sampler,
     )
 
-    print(f"Train dataloader length: {len(train_dataset)}(train_dataset) // {args.batch_size}(batch_size) * {world_size}(world_size) = {len(train_dataloader)}")
-    print(f"Val dataloader length: {len(val_dataset)}(val_dataset) // {args.batch_size}(batch_size) * {world_size}(world_size) = {len(val_dataloader)}")
+    print(
+        f"Train dataloader length: {len(train_dataset)}(train_dataset) // {args.batch_size}(batch_size) * {world_size}(world_size) = {len(train_dataloader)}"
+    )
+    print(
+        f"Val dataloader length: {len(val_dataset)}(val_dataset) // {args.batch_size}(batch_size) * {world_size}(world_size) = {len(val_dataloader)}"
+    )
 
     # Number of steps is used for the learning rate scheduler
-    num_steps = (
-        len(train_dataloader)
-        * args.num_epochs
-        // args.grad_accumulation_steps
+    num_steps = len(train_dataloader) * args.num_epochs // args.grad_accumulation_steps
+    print(
+        f"Number of training steps: {len(train_dataloader)}(train_dataloader) * {args.num_epochs}(num_epochs) // {args.grad_accumulation_steps}(grad_accumulation_steps) = {num_steps}"
     )
-    print(f"Number of training steps: {len(train_dataloader)}(train_dataloader) * {args.num_epochs}(num_epochs) // {args.grad_accumulation_steps}(grad_accumulation_steps) = {num_steps}")
 
     if args.anneal == "cos":
         lr_scheduler = WarmupCosineWithDecay(
@@ -281,7 +292,9 @@ def train(rank: int, world_size: int, train_dataset, val_dataset, model, tokeniz
             args, model, optimizer, lr_scheduler, device, torch_dtype, num_steps
         )
     else:
-        console.log(f"Starting training on GPU {rank} using {device}...", style="bold green")
+        console.log(
+            f"Starting training on GPU {rank} using {device}...", style="bold green"
+        )
 
     trainer = Trainer(
         model=model,
