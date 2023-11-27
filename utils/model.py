@@ -12,7 +12,9 @@ LLAMA_TOKENIZER_PATH = "meta-llama/Llama-2-7b-hf"
 def get_llama_model(
     config: Optional[LlamaConfig] = None, special_tokens: Optional[dict] = None
 ):
-    assert isinstance(config, LlamaConfig), "Only LlamaConfig is supported for now"
+    assert (
+        isinstance(config, LlamaConfig) or config is None
+    ), "Only LlamaConfig is supported for now"
 
     tokenizer = AutoTokenizer.from_pretrained(LLAMA_TOKENIZER_PATH)
     if special_tokens:
@@ -22,7 +24,7 @@ def get_llama_model(
         # warn the user that the default config is used
         console.log("No config is provided, using the default config", style="bold red")
         config = LlamaConfig(
-            vocab_size=tokenizer.voacab_size,
+            vocab_size=tokenizer.vocab_size,
             hidden_size=4096,
             intermediate_size=11008,
             num_hidden_layers=32,
