@@ -7,9 +7,18 @@ from rich.table import Table
 from torch.distributed import init_process_group, destroy_process_group
 from torch.utils.data import TensorDataset, DataLoader, DistributedSampler, random_split
 import warnings
-
-
-from single_gpu import Trainer
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    BackwardPrefetch,
+    ShardingStrategy,
+)
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+import functools
+from torch.distributed.fsdp.wrap import (
+    transformer_auto_wrap_policy
+)
 from trainer_fsdp import Trainer
 from model import llama_1_7_model, smaller_llama
 from utils import (
@@ -49,19 +58,6 @@ MIN_LR_FACTOR = 10
 DATASET_NUM_PROC = None
 
 
-def ddp_setup(rank, world_size):
-    # os.environ["MASTER_ADDR"] = "127.0.0.1"
-    # os.environ["MASTER_PORT"] = "1234"
-
-    if torch.cuda.is_available():
-        # initialize the process group
-        init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    else:
-        console.log(
-            "No CUDA device found. Cannot run distributed training.", style="bold red"
-        )
-
-
 def parse_args():
     import argparse
 
@@ -95,6 +91,7 @@ def parse_args():
     parser.add_argument("--ddp", action=argparse.BooleanOptionalAction)
     parser.add_argument("--local_path", action=argparse.BooleanOptionalAction)
     parser.add_argument("--fsdp", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction)
 
     args = parser.parse_args()
     return args
@@ -166,6 +163,31 @@ def load_train_objs(
 
 
 def main(args):
+    # various inits, derived attributes, I/O setup
+    ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
+    # ddp = False
+    if ddp:
+        init_process_group(backend="nccl")
+        ddp_rank = int(os.environ["RANK"])
+        ddp_local_rank = int(os.environ["LOCAL_RANK"])
+        ddp_world_size = int(os.environ["WORLD_SIZE"])
+        device = f"cuda:{ddp_local_rank}"
+        torch.cuda.set_device(device)
+        master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
+        seed_offset = ddp_rank  # each process gets a different seed
+        # world_size number of processes will be training simultaneously, so we can scale
+        # down the desired gradient accumulation iterations per process proportionally
+        assert args.grad_accumulation_steps % ddp_world_size == 0
+        args.grad_accumulation_steps //= ddp_world_size
+    else:
+        # if not ddp, we are running on a single gpu, and one process
+        master_process = True
+        seed_offset = 0
+        ddp_world_size = 1
+        device = "cuda:0"
+        ddp_local_rank = 0
+    torch.manual_seed(1337 + seed_offset)
+
     # Training Objects are loaded here
     # Datasets(train and validation)
     # model, tokenizer and optimizer
@@ -180,38 +202,75 @@ def main(args):
         subset=args.subset,
         local_path=args.local_path,
     )
+    model.to(device)
 
-    print("Loaded training objects")
-    print("Launching training...")
-
-    world_size = torch.cuda.device_count()
-    dist_training = args.ddp or args.fsdp
-    if dist_training:
-        print(f"Using {world_size} GPUs for training")
-        mp.spawn(
-            train,
-            args=(
-                world_size,
-                train_dataset,
-                val_dataset,
-                model,
-                tokenizer,
-                optimizer,
-                args,
-            ),
-            nprocs=world_size,
-        )
+    # Setting the torch dtype
+    # The default is 32-bit floating point
+    # Using mixed precision training can speed up the training process
+    # Mixed precision automatically casts the model weights to 16-bit floating point
+    # and rescales the gradients to 32-bit floating point
+    # NOTE:
+    # `mps` (Apple Silicon) currently doesn't support mixed precision training
+    if args.torch_dtype == "fp32":
+        args.torch_dtype = torch.float32
+    # Using fp16 reduces training time by a substantial margin
+    # All `cuda` GPUs support fp16
+    elif args.torch_dtype == "fp16":
+        args.torch_dtype = torch.float16
+    # bf16: Brain Floating Point
+    # Not supported by all GPUs
+    # Only Ampere GPUs support bf16, namely A100 and A6000
+    elif args.torch_dtype == "bf16":
+        args.torch_dtype = torch.bfloat16
     else:
-        train(
-            rank=0,
-            world_size=1,
-            train_dataset=train_dataset,
-            val_dataset=val_dataset,
-            model=model,
-            tokenizer=tokenizer,
-            optimizer=optimizer,
-            args=args,
-        )
+        console.log(f"Invalid torch_dtype: {args.torch_dtype}")
+        console.log("Setting torch_dtype to fp16")
+        args.torch_dtype = torch.float16
+    
+    if args.compile:
+        print("compiling the model... (takes a ~minute)")
+        model = torch.compile(model)  # requires PyTorch 2.0
+    if ddp:
+        prefix = "_orig_mod." if compile else ""
+        model._ddp_params_and_buffers_to_ignore = {prefix + "freqs_cis"}
+        if args.fsdp:
+            console.log("Using FSDP")
+            fsdp_wrap_policy = functools.partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls={
+                    LlamaDecoderLayer,
+                }
+            )
+            mixed_precision = MixedPrecision(
+                param_dtype=args.torch_dtype,
+                reduce_dtype=args.torch_dtype,
+                buffer_dtype=args.torch_dtype,
+            )
+            model = FSDP(
+                model,
+                auto_wrap_policy=fsdp_wrap_policy,
+                backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+                sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+                mixed_precision=mixed_precision,
+            )
+        else:
+            model = DDP(model, device_ids=[ddp_local_rank])
+
+    train(
+        rank=ddp_local_rank,
+        world_size=ddp_world_size,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        model=model,
+        tokenizer=tokenizer,
+        optimizer=optimizer,
+        args=args,
+        ddp=ddp,
+        master_process=master_process
+    )
+
+    if ddp:
+        destroy_process_group()
 
 
 def train(
@@ -223,11 +282,9 @@ def train(
     tokenizer,
     optimizer,
     args,
+    master_process,
+    ddp
 ):
-    dist_training = args.ddp or args.fsdp
-    if dist_training:
-        ddp_setup(rank, world_size)
-
     # Setting the device
     # Using GPUs significantly speeds up the training process
     # as well as inference
@@ -238,31 +295,8 @@ def train(
         device = "cuda"
     device = args.device or device
 
-    # Setting the torch dtype
-    # The default is 32-bit floating point
-    # Using mixed precision training can speed up the training process
-    # Mixed precision automatically casts the model weights to 16-bit floating point
-    # and rescales the gradients to 32-bit floating point
-    # NOTE:
-    # `mps` (Apple Silicon) currently doesn't support mixed precision training
-    if args.torch_dtype == "fp32":
-        torch_dtype = torch.float32
-    # Using fp16 reduces training time by a substantial margin
-    # All `cuda` GPUs support fp16
-    elif args.torch_dtype == "fp16":
-        torch_dtype = torch.float16
-    # bf16: Brain Floating Point
-    # Not supported by all GPUs
-    # Only Ampere GPUs support bf16, namely A100 and A6000
-    elif args.torch_dtype == "bf16":
-        torch_dtype = torch.bfloat16
-    else:
-        console.log(f"Invalid torch_dtype: {args.torch_dtype}")
-        console.log("Setting torch_dtype to fp16")
-        torch_dtype = torch.float16
-
     sampler = None
-    if args.ddp:
+    if ddp:
         sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
     # DataLoaders process the datasets
     # and provide an iterator
@@ -277,18 +311,18 @@ def train(
         sampler=sampler,
     )
 
-    print(
-        f"Train dataloader length: {len(train_dataset)}(train_dataset) // {args.batch_size}(batch_size) * {world_size}(world_size) = {len(train_dataloader)}"
-    )
-    print(
-        f"Val dataloader length: {len(val_dataset)}(val_dataset) // {args.batch_size}(batch_size) * {world_size}(world_size) = {len(val_dataloader)}"
-    )
-
     # Number of steps is used for the learning rate scheduler
     num_steps = len(train_dataloader) * args.num_epochs // args.grad_accumulation_steps
-    print(
-        f"Number of training steps: {len(train_dataloader)}(train_dataloader) * {args.num_epochs}(num_epochs) // {args.grad_accumulation_steps}(grad_accumulation_steps) = {num_steps}"
-    )
+    if master_process:
+        console.print(
+            f"Train dataloader length: {len(train_dataset)}(train_dataset) // {args.batch_size}(batch_size) * {world_size}(world_size) = {len(train_dataloader)}"
+        )
+        console.print(
+            f"Val dataloader length: {len(val_dataset)}(val_dataset) // {args.batch_size}(batch_size) * {world_size}(world_size) = {len(val_dataloader)}"
+        )
+        console.print(
+            f"Number of training steps: {len(train_dataloader)}(train_dataloader) * {args.num_epochs}(num_epochs) // {args.grad_accumulation_steps}(grad_accumulation_steps) = {num_steps}"
+        )
 
     if args.anneal == "cos":
         lr_scheduler = WarmupCosineWithDecay(
@@ -300,17 +334,14 @@ def train(
             eta_min=args.lr / args.min_lr_factor,
         )
     else:
-        console.log(f"Invalid anneal strategy: {args.anneal}", style="bold red")
-        console.log("Not using a learning rate scheduler")
+        if master_process:
+            console.log(f"Invalid anneal strategy: {args.anneal}", style="bold red")
+            console.log("Not using a learning rate scheduler")
         lr_scheduler = None
 
-    if rank == 0:
+    if master_process:
         log_arguments(
-            args, model, optimizer, lr_scheduler, device, torch_dtype, num_steps
-        )
-    else:
-        console.log(
-            f"Starting training on GPU {rank} using {device}...", style="bold green"
+            args, model, optimizer, lr_scheduler, device, args.torch_dtype, num_steps
         )
 
     trainer = Trainer(
@@ -326,11 +357,11 @@ def train(
         log_every=args.log_every,
         max_checkpoint_limit=MAX_CHECKPOINT_LIMIT,
         grad_accumulation_steps=args.grad_accumulation_steps,
-        torch_dtype=torch_dtype,
+        torch_dtype=args.torch_dtype,
         max_grad_norm=args.max_grad_norm,
         report_to=args.report_to,
         world_size=world_size,
-        ddp=args.ddp,
+        dist=ddp
     )
 
     trainer.train(
@@ -338,9 +369,6 @@ def train(
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run,
     )
-
-    if dist_training:
-        destroy_process_group()
 
 
 def log_arguments(args, model, optimizer, lr_scheduler, device, torch_dtype, num_steps):
