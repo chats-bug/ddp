@@ -2,7 +2,7 @@ from typing import Optional, Union, List
 import torch
 from datasets import load_dataset, Dataset
 from transformers import PreTrainedTokenizerBase
-import multiprocessing as mp
+# import multiprocessing as mp
 from tqdm import tqdm
 from multiprocessing import Pool, RLock
 if __name__ == "__main__":
@@ -76,7 +76,7 @@ def prepare_dataset(
     truncate: int = None,
     disable_tqdm: bool = False,
 ) -> torch.Tensor:
-    num_proc = mp.cpu_count() - 1 if num_proc is None else num_proc
+    num_proc = num_proc or 1
     num_partitions = num_proc if num_partitions is None else num_partitions
     chars_per_token = 5
     if truncate is not None:
@@ -157,6 +157,7 @@ if __name__ == "__main__":
     parser.add_argument("--bsz", type=int, default=4)
     parser.add_argument("--num_proc", type=int, default=8)
     parser.add_argument("--num_partitions", type=int, default=8)
+    parser.add_argument("--save", type=int, default=0)
 
     args = parser.parse_args()
 
@@ -184,13 +185,8 @@ if __name__ == "__main__":
         num_partitions=args.num_partitions,
     )
 
-    dataloader = DataLoader(
-        prepared_dataset,
-        batch_size=args.bsz,
-        shuffle=False,
-        pin_memory=True,
-    )
-
-    for batch in dataloader:
-        print(batch.shape)
-        break
+    if args.save:
+        torch.save(
+            prepared_dataset,
+            f"{args.dataset_name.split('/')[-1]}_{args.subset if args.subset > 0.0 else 'all'}_prepared.pt",
+        )

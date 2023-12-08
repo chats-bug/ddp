@@ -5,12 +5,13 @@ import torch.optim
 from rich.console import Console
 from rich.table import Table
 from torch.distributed import init_process_group, destroy_process_group
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import TensorDataset, DataLoader, DistributedSampler, random_split
 import warnings
 
 
-from model import llama_1_7_model, smaller_llama
 from single_gpu import Trainer
+from trainer_fsdp import Trainer
+from model import llama_1_7_model, smaller_llama
 from utils import (
     get_dataset,
     num_trainable_params,
@@ -49,8 +50,8 @@ DATASET_NUM_PROC = None
 
 
 def ddp_setup(rank, world_size):
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "1234"
+    # os.environ["MASTER_ADDR"] = "127.0.0.1"
+    # os.environ["MASTER_PORT"] = "1234"
 
     if torch.cuda.is_available():
         # initialize the process group
@@ -92,6 +93,8 @@ def parse_args():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--gpu_id", type=int, default=GPU_ID)
     parser.add_argument("--ddp", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--local_path", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--fsdp", action=argparse.BooleanOptionalAction)
 
     args = parser.parse_args()
     return args
@@ -106,16 +109,25 @@ def load_train_objs(
     smaller_model: bool = False,
     dataset_num_proc: int = None,
     subset: float = 0.0,
+    local_path: bool = False,
 ):
-    hf_dataset = get_dataset(dataset, split="train")
-    if subset > 0.0:
-        if subset > 1.0:
-            hf_dataset = hf_dataset.select(range(int(subset)))
-        else:
-            hf_dataset = hf_dataset.select(range(int(subset * len(hf_dataset))))
-    hf_dataset = hf_dataset.train_test_split(test_size=VAL_SIZE)
-    train_dataset = hf_dataset["train"]
-    val_dataset = hf_dataset["test"]
+    if local_path:
+        path = "/root/ddp/utils/TinyStories_all_prepared.pt"
+        dataset = torch.load(path)
+        dataset = TensorDataset(dataset)
+        dataset = random_split(dataset, [1-VAL_SIZE, VAL_SIZE])
+        train_dataset = dataset[0]
+        val_dataset = dataset[1]
+    else:
+        hf_dataset = get_dataset(dataset, split="train")
+        if subset > 0.0:
+            if subset > 1.0:
+                hf_dataset = hf_dataset.select(range(int(subset)))
+            else:
+                hf_dataset = hf_dataset.select(range(int(subset * len(hf_dataset))))
+        hf_dataset = hf_dataset.train_test_split(test_size=VAL_SIZE)
+        train_dataset = hf_dataset["train"]
+        val_dataset = hf_dataset["test"]
 
     # Add special tokens here
     # - PAD token is a special token that is used for padding
@@ -127,26 +139,27 @@ def load_train_objs(
     model = packed_obj["model"]
     tokenizer = packed_obj["tokenizer"]
 
-    train_dataset = prepare_dataset(
-        hf_dataset=train_dataset,
-        tokenizer=tokenizer,
-        max_length=seq_length,
-        dataset_text_field=dataset_text_field,
-        bos_text=tokenizer.bos_token,
-        eos_text=tokenizer.eos_token,
-        num_proc=dataset_num_proc,
-        num_partitions=dataset_num_proc,
-    )
-    val_dataset = prepare_dataset(
-        hf_dataset=val_dataset,
-        tokenizer=tokenizer,
-        max_length=seq_length,
-        dataset_text_field=dataset_text_field,
-        bos_text=tokenizer.bos_token,
-        eos_text=tokenizer.eos_token,
-        num_proc=dataset_num_proc,
-        num_partitions=dataset_num_proc,
-    )
+    if not local_path:
+        train_dataset = prepare_dataset(
+            hf_dataset=train_dataset,
+            tokenizer=tokenizer,
+            max_length=seq_length,
+            dataset_text_field=dataset_text_field,
+            bos_text=tokenizer.bos_token,
+            eos_text=tokenizer.eos_token,
+            num_proc=dataset_num_proc,
+            num_partitions=dataset_num_proc,
+        )
+        val_dataset = prepare_dataset(
+            hf_dataset=val_dataset,
+            tokenizer=tokenizer,
+            max_length=seq_length,
+            dataset_text_field=dataset_text_field,
+            bos_text=tokenizer.bos_token,
+            eos_text=tokenizer.eos_token,
+            num_proc=dataset_num_proc,
+            num_partitions=dataset_num_proc,
+        )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     return train_dataset, val_dataset, model, tokenizer, optimizer
@@ -165,13 +178,16 @@ def main(args):
         smaller_model=args.small_model,
         dataset_num_proc=args.dataset_num_proc,
         subset=args.subset,
+        local_path=args.local_path,
     )
 
     print("Loaded training objects")
     print("Launching training...")
 
     world_size = torch.cuda.device_count()
-    if args.ddp:
+    dist_training = args.ddp or args.fsdp
+    if dist_training:
+        print(f"Using {world_size} GPUs for training")
         mp.spawn(
             train,
             args=(
@@ -208,7 +224,8 @@ def train(
     optimizer,
     args,
 ):
-    if args.ddp:
+    dist_training = args.ddp or args.fsdp
+    if dist_training:
         ddp_setup(rank, world_size)
 
     # Setting the device
@@ -322,7 +339,7 @@ def train(
         wandb_run_name=args.wandb_run,
     )
 
-    if args.ddp:
+    if dist_training:
         destroy_process_group()
 
 

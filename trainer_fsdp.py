@@ -1,7 +1,5 @@
 import os
 from typing import Union, Optional, Any
-
-import torch
 from datasets import Dataset
 from torch.utils.data import DataLoader
 import wandb
@@ -14,7 +12,26 @@ from rich.progress import (
     TimeRemainingColumn,
     TimeElapsedColumn,
 )
-from torch.nn.parallel import DistributedDataParallel as DDP
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.utils.data.distributed import DistributedSampler
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    BackwardPrefetch,
+    ShardingStrategy,
+    FullStateDictConfig,
+    StateDictType,
+)
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+import functools
+from torch.distributed.fsdp.wrap import (
+    size_based_auto_wrap_policy,
+    enable_wrap,
+    wrap,
+    transformer_auto_wrap_policy
+)
 
 from utils import format_float_to_str
 
@@ -43,7 +60,7 @@ class Trainer:
         output_dir: Optional[str] = None,
         report_to: Optional[str] = None,
         world_size: int = 1,
-        ddp: bool = False,
+        ddp=None
     ):
         assert (
             save_every % eval_every == 0
@@ -73,7 +90,6 @@ class Trainer:
             # If the device is not cuda, then the gpu_id is the device
             # This because the device is either "cpu" or probably a "mps" device
             self.gpu_id = self.device  # type: ignore
-        self.ddp = ddp
 
         # Set the
         # torch.set_default_device(self.device)
@@ -99,19 +115,47 @@ class Trainer:
             else:
                 self.scaler = torch.cuda.amp.GradScaler(enabled=True)
 
-        # Wrap the model with DDP if the device is cuda
-        self.model.to(self.gpu_id)
-        if self.ddp:
-            self.model = DDP(self.model, device_ids=[self.gpu_id])
-
         if not self.output_dir:
             self.output_dir = "output"
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
+        
+        self._prepare_model()
+
+    def _prepare_model(self):
+        """
+        Prepares the model for FSDP training
+        """
+        wrap_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={
+                LlamaDecoderLayer,
+            }
+        )
+        # wrap_policy = functools.partial(
+        #     size_based_auto_wrap_policy, min_num_params=1000
+        # )
+        torch.cuda.set_device(self.gpu_id)
+
+        mp_policy = MixedPrecision(
+            param_dtype=self.torch_dtype,
+            reduce_dtype=self.torch_dtype,
+            buffer_dtype=self.torch_dtype,
+        )
+        self.model.to(self.gpu_id)
+        self.model = FSDP(
+            self.model,
+            auto_wrap_policy=wrap_policy,
+            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            mixed_precision=mp_policy,
+        )
+
 
     def _run_batch(
-        self, source, target, step=1, attention_mask: Optional[torch.Tensor] = None
+        self, source, target, step=1, attention_mask: Optional[torch.Tensor] = None, progress=None, epoch=0, opt_step=0
     ):
+        ddp_loss = torch.zeros(2).to(self.gpu_id)
         if self.scaler:
             with torch.autocast(device_type=self.device, dtype=self.torch_dtype):
                 output = self.model(
@@ -152,6 +196,19 @@ class Trainer:
                 if self.lr_schedular:
                     self.lr_schedular.step()
                 self.optimizer.zero_grad()
+        
+        ddp_loss[0] += loss.item()
+        ddp_loss[1] += len(source)
+        dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+        if self.gpu_id == 0:
+            if step % (self.log_every * self.grad_accumulation_steps) == 0:
+                formatted_lr = format_float_to_str(
+                    self.optimizer.param_groups[0]["lr"]
+                )
+                if progress:
+                    progress.console.log(
+                        f"Epoch: {epoch}, Step: {opt_step}, Learning Rate: {formatted_lr}, Loss: {(ddp_loss[0] / ddp_loss[1]):.3f}"
+                    )
         return loss.item() * self.grad_accumulation_steps
 
     def _run_eval(self, source, target):
@@ -172,15 +229,8 @@ class Trainer:
         # 2. Add the total number of steps
         with Progress(
             TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            "•",
-            TimeElapsedColumn(),
-            "•",
-            TimeRemainingColumn(),
-            "•",
-            TextColumn("[progress.percentage]{task.completed}"),
-            "•",
+            BarColumn(), TaskProgressColumn(), "•", TimeElapsedColumn(), "•",
+            TimeRemainingColumn(), "•", TextColumn("[progress.percentage]{task.completed}"), "•",
             TextColumn(f"[progress.percentage]{total_steps:,}"),
         ) as progress:
             training_task = progress.add_task(
@@ -198,7 +248,7 @@ class Trainer:
                 opt_step = step // self.grad_accumulation_steps
                 self.model.train()
                 loss += (
-                    self._run_batch(source=data, target=data, step=step)
+                    self._run_batch(source=data, target=data, step=step, progress=progress, epoch=epoch, opt_step=opt_step)
                     / self.grad_accumulation_steps
                 )
 
@@ -212,12 +262,6 @@ class Trainer:
                             "train/learning_rate": self.optimizer.param_groups[0]["lr"],
                         }
                         wandb.log(metrics)
-                    formatted_lr = format_float_to_str(
-                        self.optimizer.param_groups[0]["lr"]
-                    )
-                    progress.console.log(
-                        f"Epoch: {epoch}, Step: {opt_step}, Learning Rate: {formatted_lr}, Loss: {loss:.3f}"
-                    )
                     progress.update(training_task, advance=1, step=step)
 
                 if step % self.grad_accumulation_steps == 0:
@@ -334,7 +378,7 @@ class Trainer:
                 wandb.init(config=wandb_config)
 
         for epoch in range(max_epochs):
-            if self.ddp and self.gpu_id != 0:
+            if self.gpu_id != 0:
                 self._run_epoch_no_log(epoch)
             else:
                 self._run_epoch(epoch)

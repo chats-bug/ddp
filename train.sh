@@ -1,0 +1,1 @@
+python3 setup.py --seq_len 512 --batch_size 2 --grad_accumulation_steps 4 --num_epochs 1 --no-small_model --lr 0.0003 --max_grad_norm 1.0 --dataset_num_proc 32  --dataset_name roneneldan/TinyStories --subset 0.1 --local_path --torch_dtype fp32 --fsdp
