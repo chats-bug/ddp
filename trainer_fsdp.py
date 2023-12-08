@@ -60,7 +60,7 @@ class Trainer:
         output_dir: Optional[str] = None,
         report_to: Optional[str] = None,
         world_size: int = 1,
-        ddp=None
+        dist: bool = False,
     ):
         assert (
             save_every % eval_every == 0
@@ -86,6 +86,7 @@ class Trainer:
         self.output_dir = output_dir
         self.report_to = report_to
         self.world_size = world_size
+        self.dist = dist
         if self.device != "cuda":
             # If the device is not cuda, then the gpu_id is the device
             # This because the device is either "cpu" or probably a "mps" device
@@ -119,43 +120,13 @@ class Trainer:
             self.output_dir = "output"
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
-        
-        self._prepare_model()
 
-    def _prepare_model(self):
-        """
-        Prepares the model for FSDP training
-        """
-        wrap_policy = functools.partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls={
-                LlamaDecoderLayer,
-            }
-        )
-        # wrap_policy = functools.partial(
-        #     size_based_auto_wrap_policy, min_num_params=1000
-        # )
-        torch.cuda.set_device(self.gpu_id)
-
-        mp_policy = MixedPrecision(
-            param_dtype=self.torch_dtype,
-            reduce_dtype=self.torch_dtype,
-            buffer_dtype=self.torch_dtype,
-        )
-        self.model.to(self.gpu_id)
-        self.model = FSDP(
-            self.model,
-            auto_wrap_policy=wrap_policy,
-            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-            mixed_precision=mp_policy,
-        )
-
+        if self.dist:
+            self.raw_model = self.model.module
 
     def _run_batch(
         self, source, target, step=1, attention_mask: Optional[torch.Tensor] = None, progress=None, epoch=0, opt_step=0
     ):
-        ddp_loss = torch.zeros(2).to(self.gpu_id)
         if self.scaler:
             with torch.autocast(device_type=self.device, dtype=self.torch_dtype):
                 output = self.model(
@@ -196,19 +167,6 @@ class Trainer:
                 if self.lr_schedular:
                     self.lr_schedular.step()
                 self.optimizer.zero_grad()
-        
-        ddp_loss[0] += loss.item()
-        ddp_loss[1] += len(source)
-        dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
-        if self.gpu_id == 0:
-            if step % (self.log_every * self.grad_accumulation_steps) == 0:
-                formatted_lr = format_float_to_str(
-                    self.optimizer.param_groups[0]["lr"]
-                )
-                if progress:
-                    progress.console.log(
-                        f"Epoch: {epoch}, Step: {opt_step}, Learning Rate: {formatted_lr}, Loss: {(ddp_loss[0] / ddp_loss[1]):.3f}"
-                    )
         return loss.item() * self.grad_accumulation_steps
 
     def _run_eval(self, source, target):
@@ -262,6 +220,12 @@ class Trainer:
                             "train/learning_rate": self.optimizer.param_groups[0]["lr"],
                         }
                         wandb.log(metrics)
+                    formatted_lr = format_float_to_str(
+                        self.optimizer.param_groups[0]["lr"]
+                    )
+                    progress.console.log(
+                        f"Epoch: {epoch}, Step: {opt_step}, Learning Rate: {formatted_lr}, Loss: {loss:.3f}"
+                    )
                     progress.update(training_task, advance=1, step=step)
 
                 if step % self.grad_accumulation_steps == 0:
@@ -323,7 +287,7 @@ class Trainer:
                 step += 1
 
     def _save_checkpoint(self, epoch: int, step: int, log_fn):
-        ckp = self.model.module.state_dict() if self.ddp else self.model.state_dict()
+        ckp = self.model.module.state_dict() if self.dist else self.model.state_dict()
         ckp_path = f"{self.output_dir}/ckp_epoch_{epoch}_step_{step}.pt"
         try:
             torch.save(ckp, ckp_path)
