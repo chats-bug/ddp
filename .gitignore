@@ -37,3 +37,6 @@ wandb/
 
 # Jupyter Notebook Checkpoints
 .ipynb_checkpoints
+
+# Ignore pytorch files [.pt]
+*.pt
