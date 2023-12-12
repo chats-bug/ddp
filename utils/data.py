@@ -2,13 +2,17 @@ from typing import Optional, Union, List
 import torch
 from datasets import load_dataset, Dataset
 from transformers import PreTrainedTokenizerBase
-# import multiprocessing as mp
 from tqdm import tqdm
 from multiprocessing import Pool, RLock
 if __name__ == "__main__":
     from concat_dataset import ConcatTokensDataset
 else:
     from .concat_dataset import ConcatTokensDataset
+import os
+import warnings
+
+# ignore future warnings
+warnings.simplefilter(action="ignore", category=FutureWarning)
 
 
 def get_dataset(
@@ -154,10 +158,10 @@ if __name__ == "__main__":
         "--tokenizer_name", type=str, default="meta-llama/Llama-2-7b-hf"
     )
     parser.add_argument("--max_length", type=int, default=512)
-    parser.add_argument("--bsz", type=int, default=4)
     parser.add_argument("--num_proc", type=int, default=8)
     parser.add_argument("--num_partitions", type=int, default=8)
     parser.add_argument("--save", type=int, default=0)
+    parser.add_argument("--save_dir", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -186,7 +190,14 @@ if __name__ == "__main__":
     )
 
     if args.save:
+        path = args.save_dir or "../dumps"
+        if not os.path.exists(path):
+            os.makedirs(path)
+        
+        d_name = f"{args.dataset_name.split('/')[-1]}_{args.subset if args.subset > 0.0 else 'all'}_prepared.pt"
+        path = os.path.join(path, d_name)
         torch.save(
             prepared_dataset,
-            f"{args.dataset_name.split('/')[-1]}_{args.subset if args.subset > 0.0 else 'all'}_prepared.pt",
+            path,
         )
+        print(f"Saved prepared dataset to {path}")
