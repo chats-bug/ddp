@@ -16,24 +16,9 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    MixedPrecision,
-    BackwardPrefetch,
-    ShardingStrategy,
-    FullStateDictConfig,
-    StateDictType,
-)
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-import functools
-from torch.distributed.fsdp.wrap import (
-    size_based_auto_wrap_policy,
-    enable_wrap,
-    wrap,
-    transformer_auto_wrap_policy
-)
 
 from utils import format_float_to_str
+
 
 console = Console()
 
@@ -127,7 +112,7 @@ class Trainer:
     def _run_batch(
         self, source, target, step=1, attention_mask: Optional[torch.Tensor] = None, progress=None, epoch=0, opt_step=0
     ):
-        if self.scaler:
+        if self.scaler and not self.dist:
             with torch.autocast(device_type=self.device, dtype=self.torch_dtype):
                 output = self.model(
                     source, labels=target, attention_mask=attention_mask
@@ -315,10 +300,10 @@ class Trainer:
         wandb_run_name: Optional[str] = None,
     ):
         # Initialize wandb
-        if self.report_to == "wandb":
+        if self.report_to == "wandb" and self.gpu_id == 0:
             wandb_config = {
-                "train_batch_size": self.train_dataloader.get_batch_size(),
-                "val_batch_size": self.val_dataloader.get_batch_size(),
+                "train_batch_size": self.train_dataloader.batch_size,
+                "val_batch_size": self.val_dataloader.batch_size,
                 "eval_every": self.eval_every,
                 "save_every": self.save_every,
                 "log_every": self.log_every,
@@ -342,10 +327,10 @@ class Trainer:
                 wandb.init(config=wandb_config)
 
         for epoch in range(max_epochs):
-            if self.gpu_id != 0:
-                self._run_epoch_no_log(epoch)
-            else:
+            if self.gpu_id == 0:
                 self._run_epoch(epoch)
+            else:
+                self._run_epoch_no_log(epoch)
 
         # Finish wandb
         if self.report_to == "wandb":
