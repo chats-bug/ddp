@@ -46,6 +46,7 @@ class Trainer:
         report_to: Optional[str] = None,
         world_size: int = 1,
         dist: bool = False,
+        master_process: bool = True,
     ):
         assert (
             save_every % eval_every == 0
@@ -72,6 +73,7 @@ class Trainer:
         self.report_to = report_to
         self.world_size = world_size
         self.dist = dist
+        self.master_process = master_process
         if self.device != "cuda":
             # If the device is not cuda, then the gpu_id is the device
             # This because the device is either "cpu" or probably a "mps" device
@@ -152,59 +154,50 @@ class Trainer:
                 if self.lr_schedular:
                     self.lr_schedular.step()
                 self.optimizer.zero_grad()
-        return loss.item() * self.grad_accumulation_steps
-
-    def _run_eval(self, source, target):
-        self.model.eval()
-        with torch.no_grad():
-            output = self.model(source, labels=target)
-            loss = output.loss
         return loss
 
-    def _run_epoch(self, epoch: int):
-        train_bsz = self.train_dataloader.batch_size
-        val_bsz = self.val_dataloader.batch_size
-        total_steps = len(self.train_dataloader) // self.grad_accumulation_steps
-        step = 1
+    def _run_eval(self):
+        self.model.eval()
+        val_loss = torch.zeros(1).to(self.gpu_id)
+        for eval_data in self.val_dataloader:
+            if isinstance(eval_data, list):
+                eval_data = eval_data[0]
+            eval_data = eval_data.long()
+            eval_data = eval_data.to(self.gpu_id)
+            with torch.no_grad():
+                output = self.model(source=eval_data, labels=eval_data)
+                val_loss += output.loss
+        return val_loss / len(self.val_dataloader)
 
-        # Change the progress bar to add the following things:
-        # 1. Add the current step
-        # 2. Add the total number of steps
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(), TaskProgressColumn(), "•", TimeElapsedColumn(), "•",
-            TimeRemainingColumn(), "•", TextColumn("[progress.percentage]{task.completed}"), "•",
-            TextColumn(f"[progress.percentage]{total_steps:,}"),
-        ) as progress:
-            training_task = progress.add_task(
-                "Training...",
-                total=total_steps,
+    def _run_epoch(self, epoch: int, progress=None, training_task=None, step=1):
+        loss = 0
+        ddp_loss = torch.zeros(2).to(self.gpu_id)
+        for data in self.train_dataloader:
+            if isinstance(data, list):
+                data = data[0]
+            data = data.long()
+            data = data.to(self.gpu_id)
+
+            opt_step = step // self.grad_accumulation_steps
+            self.model.train()
+            ddp_loss[0] += (
+                self._run_batch(source=data, target=data, step=step, progress=progress, epoch=epoch, opt_step=opt_step)
             )
-
-            loss = 0
-            for data in self.train_dataloader:
-                if isinstance(data, list):
-                    data = data[0]
-                data = data.long()
-                data = data.to(self.gpu_id)
-
-                opt_step = step // self.grad_accumulation_steps
-                self.model.train()
-                loss += (
-                    self._run_batch(source=data, target=data, step=step, progress=progress, epoch=epoch, opt_step=opt_step)
-                    / self.grad_accumulation_steps
-                )
-
-                if step % (self.log_every * self.grad_accumulation_steps) == 0:
-                    # Write to wandb
-                    if self.report_to == "wandb":
-                        metrics = {
-                            "train/loss": loss,
-                            "train/epoch": epoch,
-                            "train/global_step": opt_step,
-                            "train/learning_rate": self.optimizer.param_groups[0]["lr"],
-                        }
-                        wandb.log(metrics)
+            if step % (self.log_every * self.grad_accumulation_steps) == 0:
+                # Write to wandb
+                if self.report_to == "wandb":
+                    metrics = {
+                        "train/loss": loss,
+                        "train/epoch": epoch,
+                        "train/global_step": opt_step,
+                        "train/learning_rate": self.optimizer.param_groups[0]["lr"],
+                    }
+                    wandb.log(metrics)
+                if self.dist:
+                    handle = dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM, async_op=True)
+                    handle.wait()
+                loss = ddp_loss[0].item() / self.world_size
+                if self.master_process:
                     formatted_lr = format_float_to_str(
                         self.optimizer.param_groups[0]["lr"]
                     )
@@ -213,63 +206,58 @@ class Trainer:
                     )
                     progress.update(training_task, advance=1, step=step)
 
-                if step % self.grad_accumulation_steps == 0:
-                    loss = 0
+            if step % self.grad_accumulation_steps == 0:
+                ddp_loss[0] = 0
+                loss = 0
 
-                if step % (self.eval_every * self.grad_accumulation_steps) == 0:
-                    self.model.eval()
-                    val_loss = 0
-                    progress.console.log(
-                        f"Running validation on {len(self.val_dataloader)*val_bsz} samples"
-                    )
-                    for ev_source, ev_target in self.val_dataloader:
-                        ev_source = ev_source.to(self.gpu_id)
-                        ev_target = ev_target.to(self.gpu_id)
-                        val_loss += self._run_eval(ev_source, ev_target)
-                    val_loss /= len(self.val_dataloader)  # type: ignore
-                    # Write to wandb
-                    if self.report_to == "wandb":
-                        metrics = {
-                            "eval/loss": val_loss,
-                        }
-                        wandb.log(metrics)
+            if step % (self.eval_every * self.grad_accumulation_steps) == 0:
+                val_loss = self._run_eval()
+                if self.dist:
+                    handle = dist.all_reduce(val_loss, op=dist.ReduceOp.SUM, async_op=True)
+                    handle.wait()
+                # Write to wandb
+                if self.report_to == "wandb":
+                    metrics = {
+                        "eval/loss": val_loss,
+                    }
+                    wandb.log(metrics)
 
-                    progress.console.log("=" * 80)
-                    progress.console.log(
-                        f"Epoch: {epoch}, Step: {opt_step}, Val loss: {val_loss:.4f}"
+                progress.console.log("=" * 80)
+                progress.console.log(
+                    f"Epoch: {epoch}, Step: {opt_step}, Val loss: {val_loss:.4f}"
+                )
+                if (
+                    step % (self.save_every * self.grad_accumulation_steps) == 0
+                    and self.master_process
+                ):
+                    path = self._save_checkpoint(
+                        epoch, opt_step, progress.console.log
                     )
-                    if (
-                        step % (self.save_every * self.grad_accumulation_steps) == 0
-                        and self.gpu_id == 0
-                    ):
-                        path = self._save_checkpoint(
-                            epoch, opt_step, progress.console.log
+                    if path:
+                        self.checkpoint_val_losses.append(
+                            {"ckp_path": path, "val_loss": val_loss}
                         )
+                        # Sort the checkpoints by val_loss
+                        self._sort_checkpoints_by_val_loss()
+                        # progress.console.log(self.checkpoint_val_losses)
+                    if len(self.checkpoint_val_losses) > self.max_checkpoint_limit:
+                        progress.console.log(
+                            "Comparing all checkpoints since the max checkpoint limit has been reached"
+                        )
+                        # Delete the worst checkpoint
+                        # Since the checkpoints are sorted by val_loss in ascending order,
+                        # the last checkpoint is the worst checkpoint
+                        worst_checkpoint_path: str = self.checkpoint_val_losses[-1][
+                            "ckp_path"
+                        ]
+                        path = self._delete_checkpoint(worst_checkpoint_path)
                         if path:
-                            self.checkpoint_val_losses.append(
-                                {"ckp_path": path, "val_loss": val_loss}
-                            )
-                            # Sort the checkpoints by val_loss
-                            self._sort_checkpoints_by_val_loss()
-                            # progress.console.log(self.checkpoint_val_losses)
-                        if len(self.checkpoint_val_losses) > self.max_checkpoint_limit:
                             progress.console.log(
-                                "Comparing all checkpoints since the max checkpoint limit has been reached"
+                                f"Deleted checkpoint at {self.checkpoint_val_losses.pop()['ckp_path']}"
                             )
-                            # Delete the worst checkpoint
-                            # Since the checkpoints are sorted by val_loss in ascending order,
-                            # the last checkpoint is the worst checkpoint
-                            worst_checkpoint_path: str = self.checkpoint_val_losses[-1][
-                                "ckp_path"
-                            ]
-                            path = self._delete_checkpoint(worst_checkpoint_path)
-                            if path:
-                                progress.console.log(
-                                    f"Deleted checkpoint at {self.checkpoint_val_losses.pop()['ckp_path']}"
-                                )
-                    progress.console.log("=" * 80)
+                progress.console.log("=" * 80)
 
-                step += 1
+            step += 1
 
     def _save_checkpoint(self, epoch: int, step: int, log_fn):
         ckp = self.model.module.state_dict() if self.dist else self.model.state_dict()
@@ -300,7 +288,7 @@ class Trainer:
         wandb_run_name: Optional[str] = None,
     ):
         # Initialize wandb
-        if self.report_to == "wandb" and self.gpu_id == 0:
+        if self.report_to == "wandb" and self.master_process:
             wandb_config = {
                 "train_batch_size": self.train_dataloader.batch_size,
                 "val_batch_size": self.val_dataloader.batch_size,
@@ -327,48 +315,23 @@ class Trainer:
                 wandb.init(config=wandb_config)
 
         for epoch in range(max_epochs):
-            if self.gpu_id == 0:
-                self._run_epoch(epoch)
+            if self.master_process:
+                total_steps = len(self.train_dataloader) // self.grad_accumulation_steps
+                step = 1
+                with Progress(
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(), TaskProgressColumn(), "•", TimeElapsedColumn(), "•",
+                    TimeRemainingColumn(), "•", TextColumn("[progress.percentage]{task.completed}"), "•",
+                    TextColumn(f"[progress.percentage]{total_steps:,}"),
+                ) as progress:
+                    training_task = progress.add_task(
+                        "Training...",
+                        total=total_steps,
+                    )
+                    self._run_epoch(epoch, progress, training_task, step)
             else:
-                self._run_epoch_no_log(epoch)
+                self._run_epoch(epoch, None, None, 1)
 
         # Finish wandb
         if self.report_to == "wandb":
             wandb.finish()
-
-    def _run_epoch_no_log(self, epoch: int):
-        train_bsz = self.train_dataloader.batch_size
-        val_bsz = self.val_dataloader.batch_size
-        total_steps = len(self.train_dataloader) // self.grad_accumulation_steps
-        step = 1
-
-        # Change the progress bar to add the following things:
-        # 1. Add the current step
-        # 2. Add the total number of steps
-        loss = 0
-        for data in self.train_dataloader:
-            if isinstance(data, list):
-                data = data[0]
-            data = data.long()
-            data.to(self.gpu_id)
-
-            opt_step = step // self.grad_accumulation_steps
-            self.model.train()
-            loss += (
-                self._run_batch(source=data, target=data, step=step)
-                / self.grad_accumulation_steps
-            )
-
-            if step % self.grad_accumulation_steps == 0:
-                loss = 0
-
-            if step % (self.eval_every * self.grad_accumulation_steps) == 0:
-                self.model.eval()
-                val_loss = 0
-                for ev_source, ev_target in self.val_dataloader:
-                    ev_source = ev_source.to(self.gpu_id)
-                    ev_target = ev_target.to(self.gpu_id)
-                    val_loss += self._run_eval(ev_source, ev_target)
-                val_loss /= len(self.val_dataloader)  # type: ignore
-
-            step += 1
