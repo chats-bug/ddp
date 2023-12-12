@@ -8,17 +8,8 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.utils.data import TensorDataset, DataLoader, DistributedSampler, random_split
 import warnings
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    MixedPrecision,
-    BackwardPrefetch,
-    ShardingStrategy,
-)
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-import functools
-from torch.distributed.fsdp.wrap import (
-    transformer_auto_wrap_policy
-)
+
 from trainer_fsdp import Trainer
 from model import llama_1_7_model, smaller_llama
 from utils import (
@@ -26,7 +17,9 @@ from utils import (
     num_trainable_params,
     WarmupCosineWithDecay,
     prepare_dataset,
+    prepare_model_for_fsdp,
 )
+
 
 # Suppressing future warnings
 warnings.simplefilter(action="ignore", category=FutureWarning)
@@ -89,7 +82,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--gpu_id", type=int, default=GPU_ID)
     parser.add_argument("--ddp", action=argparse.BooleanOptionalAction)
-    parser.add_argument("--local_path", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--local_path", type=str, default=None)
     parser.add_argument("--fsdp", action=argparse.BooleanOptionalAction)
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction)
 
@@ -106,11 +99,17 @@ def load_train_objs(
     smaller_model: bool = False,
     dataset_num_proc: int = None,
     subset: float = 0.0,
-    local_path: bool = False,
+    local_path: str = None,
 ):
     if local_path:
-        path = "/root/ddp/utils/TinyStories_all_prepared.pt"
+        path = local_path
+        if not os.path.exists(path):
+            raise ValueError(f"Path {path} does not exist")
+        console.log(f"Loading dataset from {path}")
         dataset = torch.load(path)
+        # cut the seq len to the desired length
+        dataset = dataset[:, :seq_length]
+        console.print(f"Dataset shape: {dataset.shape}")
         dataset = TensorDataset(dataset)
         dataset = random_split(dataset, [1-VAL_SIZE, VAL_SIZE])
         train_dataset = dataset[0]
@@ -234,24 +233,12 @@ def main(args):
         prefix = "_orig_mod." if compile else ""
         model._ddp_params_and_buffers_to_ignore = {prefix + "freqs_cis"}
         if args.fsdp:
-            console.log("Using FSDP")
-            fsdp_wrap_policy = functools.partial(
-                transformer_auto_wrap_policy,
-                transformer_layer_cls={
-                    LlamaDecoderLayer,
-                }
-            )
-            mixed_precision = MixedPrecision(
-                param_dtype=args.torch_dtype,
-                reduce_dtype=args.torch_dtype,
-                buffer_dtype=args.torch_dtype,
-            )
-            model = FSDP(
+            model = prepare_model_for_fsdp(
                 model,
-                auto_wrap_policy=fsdp_wrap_policy,
-                backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-                sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-                mixed_precision=mixed_precision,
+                transformer_layer_cls=LlamaDecoderLayer,
+                torch_dtype=args.torch_dtype,
+                backward_prefetch="pre",
+                sharding_strategy="grad_op",
             )
         else:
             model = DDP(model, device_ids=[ddp_local_rank])
@@ -378,7 +365,7 @@ def log_arguments(args, model, optimizer, lr_scheduler, device, torch_dtype, num
     table.add_column("Value")
 
     # Model parameters
-    table.add_row("Model Type", str(model.config.model_type))
+    # table.add_row("Model Type", str(model.config.model_type))
     table.add_row("Model Size", f"{(num_trainable_params(model) / 1e9):.2f}B")
     table.add_row("Dataset", str(args.dataset_name))
     table.add_row("Dataset Text Field", str(args.dataset_text_field))
