@@ -26,7 +26,7 @@ warnings.simplefilter(action="ignore", category=FutureWarning)
 console = Console()
 
 DATASET_NAME = "togethercomputer/RedPajama-Data-1T-Sample"
-VAL_SIZE = 0.01
+VAL_SIZE = 0.0001
 SEQ_LENGTH = 512
 BATCH_SIZE = 8
 DATASET_TEXT_FIELD = "text"
@@ -94,8 +94,7 @@ def load_train_objs(
     dataset: str,
     dataset_text_field: str,
     seq_length: int,
-    lr: float,
-    weight_decay: float,
+    bsz: int,
     smaller_model: bool = False,
     dataset_num_proc: int = None,
     subset: float = 0.0,
@@ -109,11 +108,17 @@ def load_train_objs(
         dataset = torch.load(path)
         # cut the seq len to the desired length
         dataset = dataset[:, :seq_length]
-        console.print(f"Dataset shape: {dataset.shape}")
-        dataset = TensorDataset(dataset)
-        dataset = random_split(dataset, [1-VAL_SIZE, VAL_SIZE])
-        train_dataset = dataset[0]
-        val_dataset = dataset[1]
+
+        train_dataset = dataset[:int((1-VAL_SIZE)*len(dataset)), :]
+        val_dataset = dataset[int((1-VAL_SIZE)*len(dataset)):, :]
+
+        # # Cut the train and val datasets to the closest multiple of the batch size
+        # # This is done to avoid the `IndexError: Caught IndexError in DataLoader worker process 0.` error in the DataLoader
+        train_dataset = train_dataset[:(len(train_dataset) - (len(train_dataset) % bsz)), :]
+        val_dataset = val_dataset[:(len(val_dataset) - (len(val_dataset) % bsz)), :]
+        train_dataset = TensorDataset(train_dataset)
+        val_dataset = TensorDataset(val_dataset)
+
     else:
         hf_dataset = get_dataset(dataset, split="train")
         if subset > 0.0:
@@ -156,9 +161,8 @@ def load_train_objs(
             num_proc=dataset_num_proc,
             num_partitions=dataset_num_proc,
         )
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    return train_dataset, val_dataset, model, tokenizer, optimizer
+    
+    return train_dataset, val_dataset, model, tokenizer
 
 
 def main(args):
@@ -166,10 +170,10 @@ def main(args):
     ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
     # ddp = False
     if ddp:
-        init_process_group(backend="nccl")
         ddp_rank = int(os.environ["RANK"])
         ddp_local_rank = int(os.environ["LOCAL_RANK"])
         ddp_world_size = int(os.environ["WORLD_SIZE"])
+        init_process_group(backend="nccl", rank=ddp_rank, world_size=ddp_world_size)
         device = f"cuda:{ddp_local_rank}"
         torch.cuda.set_device(device)
         master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
@@ -183,19 +187,19 @@ def main(args):
         master_process = True
         seed_offset = 0
         ddp_world_size = 1
-        device = "cuda:0"
-        ddp_local_rank = 0
+        ddp_local_rank = args.gpu_id
+        device = f"cuda:{ddp_local_rank}"
+        torch.cuda.set_device(device)
     torch.manual_seed(1337 + seed_offset)
 
     # Training Objects are loaded here
     # Datasets(train and validation)
     # model, tokenizer and optimizer
-    train_dataset, val_dataset, model, tokenizer, optimizer = load_train_objs(
+    train_dataset, val_dataset, model, tokenizer = load_train_objs(
         dataset=args.dataset_name,
         seq_length=args.seq_len,
         dataset_text_field=args.dataset_text_field,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
+        bsz=args.batch_size,
         smaller_model=args.small_model,
         dataset_num_proc=args.dataset_num_proc,
         subset=args.subset,
@@ -243,6 +247,7 @@ def main(args):
         else:
             model = DDP(model, device_ids=[ddp_local_rank])
 
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     train(
         rank=ddp_local_rank,
         world_size=ddp_world_size,
@@ -282,20 +287,26 @@ def train(
         device = "cuda"
     device = args.device or device
 
-    sampler = None
+    train_sampler = None
+    val_sampler = None
     if ddp:
-        sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    
+    train_kwargs = {'batch_size': args.batch_size, 'sampler': train_sampler}
+    val_kwargs = {'batch_size': args.batch_size, 'sampler': val_sampler}
+    cuda_kwargs = {'num_workers': 2, 'pin_memory': True, 'shuffle': False}
     # DataLoaders process the datasets
     # and provide an iterator
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
-        sampler=sampler,
+        **train_kwargs,
+        **cuda_kwargs,
     )
     val_dataloader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
-        sampler=sampler,
+        **val_kwargs,
+        **cuda_kwargs,
     )
 
     # Number of steps is used for the learning rate scheduler
@@ -348,7 +359,8 @@ def train(
         max_grad_norm=args.max_grad_norm,
         report_to=args.report_to,
         world_size=world_size,
-        dist=ddp
+        dist=ddp,
+        master_process=master_process,
     )
 
     trainer.train(
