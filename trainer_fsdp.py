@@ -165,7 +165,7 @@ class Trainer:
             eval_data = eval_data.long()
             eval_data = eval_data.to(self.gpu_id)
             with torch.no_grad():
-                output = self.model(source=eval_data, labels=eval_data)
+                output = self.model(eval_data, labels=eval_data)
                 val_loss += output.loss
         return val_loss / len(self.val_dataloader)
 
@@ -184,20 +184,19 @@ class Trainer:
                 self._run_batch(source=data, target=data, step=step, progress=progress, epoch=epoch, opt_step=opt_step)
             )
             if step % (self.log_every * self.grad_accumulation_steps) == 0:
-                # Write to wandb
-                if self.report_to == "wandb":
-                    metrics = {
-                        "train/loss": loss,
-                        "train/epoch": epoch,
-                        "train/global_step": opt_step,
-                        "train/learning_rate": self.optimizer.param_groups[0]["lr"],
-                    }
-                    wandb.log(metrics)
                 if self.dist:
                     handle = dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM, async_op=True)
                     handle.wait()
                 loss = ddp_loss[0].item() / self.world_size
                 if self.master_process:
+                    if self.report_to == "wandb":
+                        metrics = {
+                            "train/loss": loss,
+                            "train/epoch": epoch,
+                            "train/global_step": opt_step,
+                            "train/learning_rate": self.optimizer.param_groups[0]["lr"],
+                        }
+                        wandb.log(metrics)
                     formatted_lr = format_float_to_str(
                         self.optimizer.param_groups[0]["lr"]
                     )
@@ -215,17 +214,19 @@ class Trainer:
                 if self.dist:
                     handle = dist.all_reduce(val_loss, op=dist.ReduceOp.SUM, async_op=True)
                     handle.wait()
+                val_loss = val_loss.item() / self.world_size
                 # Write to wandb
-                if self.report_to == "wandb":
+                if self.report_to == "wandb" and self.master_process:
                     metrics = {
                         "eval/loss": val_loss,
                     }
                     wandb.log(metrics)
 
-                progress.console.log("=" * 80)
-                progress.console.log(
-                    f"Epoch: {epoch}, Step: {opt_step}, Val loss: {val_loss:.4f}"
-                )
+                if self.master_process:
+                    progress.console.log("=" * 80)
+                    progress.console.log(
+                        f"Epoch: {epoch}, Step: {opt_step}, Val loss: {val_loss:.4f}"
+                    )
                 if (
                     step % (self.save_every * self.grad_accumulation_steps) == 0
                     and self.master_process
@@ -251,11 +252,12 @@ class Trainer:
                             "ckp_path"
                         ]
                         path = self._delete_checkpoint(worst_checkpoint_path)
-                        if path:
+                        if path and self.master_process:
                             progress.console.log(
                                 f"Deleted checkpoint at {self.checkpoint_val_losses.pop()['ckp_path']}"
                             )
-                progress.console.log("=" * 80)
+                if self.master_process:
+                    progress.console.log("=" * 80)
 
             step += 1
 
@@ -333,5 +335,5 @@ class Trainer:
                 self._run_epoch(epoch, None, None, 1)
 
         # Finish wandb
-        if self.report_to == "wandb":
+        if self.report_to == "wandb" and self.master_process:
             wandb.finish()
