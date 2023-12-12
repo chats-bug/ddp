@@ -83,10 +83,4 @@ def prepare_model_for_fsdp(model, **kwargs):
 		**kwargs,
 	)
 
-	console.print("FSDP Model Args:")
-	console.print(f"mixed_precision: {mixed_precision}")
-	console.print(f"auto_wrap_policy: {fsdp_wrap_policy}")
-	console.print(f"transformer_layer_class: {transformer_layer_class}")
-	console.print(f"backward_prefetch: {backward_prefetch}")
-
 	return model
