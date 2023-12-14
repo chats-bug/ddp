@@ -11,7 +11,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 from trainer_fsdp import Trainer
-from model import llama_1_7_model, smaller_llama
+from model import llama_1_7_model, smaller_llama, original_llama
 from utils import (
     get_dataset,
     num_trainable_params,
@@ -85,6 +85,7 @@ def parse_args():
     parser.add_argument("--local_path", type=str, default=None)
     parser.add_argument("--fsdp", action=argparse.BooleanOptionalAction)
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--original_llama", action=argparse.BooleanOptionalAction)
 
     args = parser.parse_args()
     return args
@@ -96,6 +97,7 @@ def load_train_objs(
     seq_length: int,
     bsz: int,
     smaller_model: bool = False,
+    orig_llama: bool = False,
     dataset_num_proc: int = None,
     subset: float = 0.0,
     local_path: str = None,
@@ -133,7 +135,9 @@ def load_train_objs(
     # Add special tokens here
     # - PAD token is a special token that is used for padding
     special_tokens = {"pad_token": "[PAD]"}
-    if smaller_model:
+    if orig_llama:
+        packed_obj = original_llama(seq_length, special_tokens)
+    elif smaller_model:
         packed_obj = smaller_llama(seq_length, special_tokens)
     else:
         packed_obj = llama_1_7_model(seq_length, special_tokens)
@@ -201,6 +205,7 @@ def main(args):
         dataset_text_field=args.dataset_text_field,
         bsz=args.batch_size,
         smaller_model=args.small_model,
+        orig_llama=args.original_llama,
         dataset_num_proc=args.dataset_num_proc,
         subset=args.subset,
         local_path=args.local_path,
