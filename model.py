@@ -51,3 +51,8 @@ def smaller_llama(seq_len: int = 512, special_tokens: dict = None):
         attention_bias=False,
     )
     return get_llama_model(config, special_tokens)
+
+
+def original_llama(seq_len: int = 1024, special_tokens: dict = None):
+    config = None
+    return get_llama_model(config, special_tokens)
