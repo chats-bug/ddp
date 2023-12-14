@@ -79,10 +79,12 @@ def prepare_dataset(
     num_partitions: int | None = 4,
     truncate: int = None,
     disable_tqdm: bool = False,
+    split_rows: bool = False,
 ) -> torch.Tensor:
     num_proc = num_proc or 1
     num_partitions = num_proc if num_partitions is None else num_partitions
     chars_per_token = 5
+    words_per_token = 1
     if truncate is not None:
         truncate = int(truncate)
         hf_dataset = hf_dataset.map(
@@ -93,6 +95,33 @@ def prepare_dataset(
             # batched=True,
             # batch_size=1,
         )
+    
+    # split each row in the dataset into multiple rows
+    # each containing chars_per_token * max_length characters
+    # this is to avoid the tokenizer from crashing due to
+    # memory issues
+    if split_rows:
+
+        def process_rows(x):
+            chunks = []
+            for sentence in x[dataset_text_field]:
+                sentence = sentence.split(" ")
+                chunks += [
+                    " ".join(sentence[i : i + words_per_token * max_length])
+                    for i in range(0, len(sentence), words_per_token * max_length)
+                ]
+            if len(chunks[-1].split(" ")) < words_per_token * max_length // 2:
+                chunks[-2] += " " + chunks[-1]
+                chunks = chunks[:-1]
+            return {dataset_text_field: chunks}
+
+        hf_dataset = hf_dataset.map(
+            process_rows,
+            num_proc=num_proc,
+            batched=True,
+            batch_size=1,
+        )
+    
     hf_dataset = hf_dataset.map(
         lambda x: tokenizer(
             x[dataset_text_field],
@@ -158,6 +187,7 @@ if __name__ == "__main__":
         "--tokenizer_name", type=str, default="meta-llama/Llama-2-7b-hf"
     )
     parser.add_argument("--max_length", type=int, default=512)
+    parser.add_argument("--split_rows", action=argparse.BooleanOptionalAction)
     parser.add_argument("--num_proc", type=int, default=8)
     parser.add_argument("--num_partitions", type=int, default=8)
     parser.add_argument("--save", type=int, default=0)
@@ -187,6 +217,8 @@ if __name__ == "__main__":
         eos_text="",
         num_proc=args.num_proc,
         num_partitions=args.num_partitions,
+        disable_tqdm=False,
+        split_rows=args.split_rows,
     )
 
     if args.save:
