@@ -114,7 +114,7 @@ class Trainer:
     def _run_batch(
         self, source, target, step=1, attention_mask: Optional[torch.Tensor] = None, progress=None, epoch=0, opt_step=0
     ):
-        if self.scaler and not self.dist:
+        if self.scaler:
             with torch.autocast(device_type=self.device, dtype=self.torch_dtype):
                 output = self.model(
                     source, labels=target, attention_mask=attention_mask
