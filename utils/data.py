@@ -231,7 +231,7 @@ if __name__ == "__main__":
         if not os.path.exists(path):
             os.makedirs(path)
         
-        d_name = f"{args.dataset_name.split('/')[-1]}_{args.subset if args.subset > 0.0 else 'all'}_prepared.pt"
+        d_name = f"{args.dataset_name.split('/')[-1]}_{args.subset if args.subset > 0.0 else 'all'}_{args.max_length}_prepared.pt"
         path = os.path.join(path, d_name)
         torch.save(
             prepared_dataset,
