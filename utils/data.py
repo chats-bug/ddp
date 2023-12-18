@@ -147,8 +147,8 @@ def prepare_dataset(
     )
 
     split_kwds = []
-    for index in tqdm(range(num_partitions)):
-        shard = hf_dataset.shard(num_partitions, index)
+    for index in tqdm(range(num_partitions), desc="Sharding dataset"):
+        shard = hf_dataset.select(range(index*sz, (index+1)*sz))
         split_kwds.append(
             (
                 shard,
