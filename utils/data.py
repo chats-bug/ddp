@@ -85,6 +85,10 @@ def prepare_dataset(
     num_partitions = num_proc if num_partitions is None else num_partitions
     chars_per_token = 5
     words_per_token = 1
+
+    # remove all columns except the dataset_text_field
+    hf_dataset = hf_dataset.select_columns(dataset_text_field)
+
     if truncate is not None:
         truncate = int(truncate)
         hf_dataset = hf_dataset.map(
@@ -110,9 +114,10 @@ def prepare_dataset(
                     " ".join(sentence[i : i + words_per_token * max_length])
                     for i in range(0, len(sentence), words_per_token * max_length)
                 ]
-            if len(chunks[-1].split(" ")) < words_per_token * max_length // 2:
-                chunks[-2] += " " + chunks[-1]
-                chunks = chunks[:-1]
+            if len(chunks) > 1:
+                if len(chunks[-1].split(" ")) < words_per_token * max_length // 2:
+                    chunks[-2] += " " + chunks[-1]
+                    chunks = chunks[:-1]
             return {dataset_text_field: chunks}
 
         hf_dataset = hf_dataset.map(
@@ -142,7 +147,7 @@ def prepare_dataset(
     )
 
     split_kwds = []
-    for index in range(num_partitions):
+    for index in tqdm(range(num_partitions)):
         shard = hf_dataset.shard(num_partitions, index)
         split_kwds.append(
             (
