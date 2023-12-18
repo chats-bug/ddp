@@ -13,9 +13,10 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 import torch
-import torch.distributed as dist
+import torch.distributed as distributed
 import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, FullStateDictConfig, StateDictType
 
 from utils import format_float_to_str
 
@@ -185,7 +186,7 @@ class Trainer:
             )
             if step % (self.log_every * self.grad_accumulation_steps) == 0:
                 if self.dist:
-                    handle = dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM, async_op=True)
+                    handle = distributed.all_reduce(ddp_loss, op=distributed.ReduceOp.SUM, async_op=True)
                     handle.wait()
                 loss = ddp_loss[0].item() / self.world_size
                 if self.master_process:
@@ -212,7 +213,7 @@ class Trainer:
             if step % (self.eval_every * self.grad_accumulation_steps) == 0:
                 val_loss = self._run_eval()
                 if self.dist:
-                    handle = dist.all_reduce(val_loss, op=dist.ReduceOp.SUM, async_op=True)
+                    handle = distributed.all_reduce(val_loss, op=distributed.ReduceOp.SUM, async_op=True)
                     handle.wait()
                 val_loss = val_loss.item() / self.world_size
                 # Write to wandb
@@ -229,48 +230,54 @@ class Trainer:
                     )
                 if (
                     step % (self.save_every * self.grad_accumulation_steps) == 0
-                    and self.master_process
                 ):
                     path = self._save_checkpoint(
-                        epoch, opt_step, progress.console.log
+                        epoch, opt_step, progress.console.log if self.master_process else None
                     )
-                    if path:
-                        self.checkpoint_val_losses.append(
-                            {"ckp_path": path, "val_loss": val_loss}
-                        )
-                        # Sort the checkpoints by val_loss
-                        self._sort_checkpoints_by_val_loss()
-                        # progress.console.log(self.checkpoint_val_losses)
-                    if len(self.checkpoint_val_losses) > self.max_checkpoint_limit:
-                        progress.console.log(
-                            "Comparing all checkpoints since the max checkpoint limit has been reached"
-                        )
-                        # Delete the worst checkpoint
-                        # Since the checkpoints are sorted by val_loss in ascending order,
-                        # the last checkpoint is the worst checkpoint
-                        worst_checkpoint_path: str = self.checkpoint_val_losses[-1][
-                            "ckp_path"
-                        ]
-                        path = self._delete_checkpoint(worst_checkpoint_path)
-                        if path and self.master_process:
-                            progress.console.log(
-                                f"Deleted checkpoint at {self.checkpoint_val_losses.pop()['ckp_path']}"
+                    if self.master_process:
+                        if path:
+                            self.checkpoint_val_losses.append(
+                                {"ckp_path": path, "val_loss": val_loss}
                             )
+                            # Sort the checkpoints by val_loss
+                            self._sort_checkpoints_by_val_loss()
+                            # progress.console.log(self.checkpoint_val_losses)
+                        if len(self.checkpoint_val_losses) > self.max_checkpoint_limit:
+                            progress.console.log(
+                                "Comparing all checkpoints since the max checkpoint limit has been reached"
+                            )
+                            # Delete the worst checkpoint
+                            # Since the checkpoints are sorted by val_loss in ascending order,
+                            # the last checkpoint is the worst checkpoint
+                            worst_checkpoint_path: str = self.checkpoint_val_losses[-1][
+                                "ckp_path"
+                            ]
+                            path = self._delete_checkpoint(worst_checkpoint_path)
+                            if path:
+                                progress.console.log(
+                                    f"Deleted checkpoint at {self.checkpoint_val_losses.pop()['ckp_path']}"
+                                )
                 if self.master_process:
                     progress.console.log("=" * 80)
 
             step += 1
 
     def _save_checkpoint(self, epoch: int, step: int, log_fn):
-        ckp = self.model.module.state_dict() if self.dist else self.model.state_dict()
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        if self.dist:
+            with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, cfg):
+                ckp = self.model.state_dict()
+        else:
+            ckp = self.model.state_dict()
         ckp_path = f"{self.output_dir}/ckp_epoch_{epoch}_step_{step}.pt"
-        try:
-            torch.save(ckp, ckp_path)
-            log_fn(f"Saved checkpoint at ckp_epoch_{epoch}_step_{step}.pt")
-            return ckp_path
-        except Exception as e:
-            log_fn(f"Error saving checkpoint: {e}")
-            return None
+        if self.master_process:
+            try:
+                torch.save(ckp, ckp_path)
+                log_fn(f"Saved checkpoint at ckp_epoch_{epoch}_step_{step}.pt")
+                return ckp_path
+            except Exception as e:
+                log_fn(f"Error saving checkpoint: {e}")
+                return None
 
     def _delete_checkpoint(self, ckp_path: str):
         if os.path.exists(ckp_path):
