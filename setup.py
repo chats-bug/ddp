@@ -72,6 +72,7 @@ def parse_args():
     parser.add_argument("--eval_every", type=int, default=EVAL_EVERY)
     parser.add_argument("--save_every", type=int, default=SAVE_EVERY)
     parser.add_argument("--log_every", type=int, default=LOG_EVERY)
+    parser.add_argument("--max_checkpoint_limit", type=int, default=MAX_CHECKPOINT_LIMIT)
     parser.add_argument("--report_to", type=str, default=REPORT_TO)
     parser.add_argument("--wandb_project", type=str, default=WANDB_PROJECT)
     parser.add_argument("--wandb_run", type=str, default=WANDB_RUN)
@@ -358,7 +359,7 @@ def train(
         eval_every=args.eval_every,
         save_every=args.save_every,
         log_every=args.log_every,
-        max_checkpoint_limit=MAX_CHECKPOINT_LIMIT,
+        max_checkpoint_limit=args.max_checkpoint_limit,
         grad_accumulation_steps=args.grad_accumulation_steps,
         torch_dtype=args.torch_dtype,
         max_grad_norm=args.max_grad_norm,
